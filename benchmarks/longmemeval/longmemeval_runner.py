@@ -375,9 +375,31 @@ class LongMemEvalBenchmark:
 
         sentences = search_results.get("sentences") or []
         if sentences:
+            # Group by session_id so the LLM sees each conversation as a block
+            session_sents: dict[str, list[dict[str, Any]]] = {}
+            session_order: list[str] = []
+            for sent in sentences:
+                ssid = sent.get("session_id") or "unknown"
+                if ssid not in session_sents:
+                    session_sents[ssid] = []
+                    session_order.append(ssid)
+                session_sents[ssid].append(sent)
+
             lines.append("\n## Session Context")
-            for i, sent in enumerate(sentences, 1):
-                lines.append(f"{i}. {sent.get('text', str(sent))}")
+            for n, ssid in enumerate(session_order, 1):
+                sents = session_sents[ssid]
+                # Use created_at of first sentence as session date hint
+                date_hint = ""
+                for s in sents:
+                    ts = s.get("created_at") or ""
+                    if ts:
+                        date_hint = f" [{str(ts)[:10]}]"
+                        break
+                lines.append(f"\n### Session {n}{date_hint}")
+                for sent in sents:
+                    role = sent.get("role", "")
+                    prefix = f"[{role.upper()}] " if role else ""
+                    lines.append(f"  {prefix}{sent.get('text', str(sent))}")
 
         return "\n".join(lines) if lines else "No relevant context retrieved."
 
