@@ -247,12 +247,6 @@ class LongMemEvalBenchmark:
                 if new_facts:  # don't cache failed/empty extractions — allow retry on next run
                     await self._session_cache.put(hsid, new_facts)
 
-        # One cross-session insight pass over the full question haystack.
-        try:
-            await self.vektori_client.generate_insights(user_id=user_id)
-        except Exception as e:
-            logger.warning("Insight generation failed for user %s: %s", user_id, e)
-
     async def _replay_session(
         self,
         session: list[dict[str, str]],
@@ -312,7 +306,6 @@ class LongMemEvalBenchmark:
             user_id=user_id,
             session_time=session_time,
             _capture_out=captured_facts,
-            _skip_cross_session=True,   # insights generated once after all sessions load
         )
 
         return captured_facts
@@ -366,12 +359,6 @@ class LongMemEvalBenchmark:
                 if ts:
                     date_prefix = f"[{str(ts)[:10]}] "
                 lines.append(f"{i}. {date_prefix}{fact.get('text', str(fact))}")
-
-        insights = search_results.get("insights") or []
-        if insights:
-            lines.append("\n## Insights")
-            for i, ins in enumerate(insights, 1):
-                lines.append(f"{i}. {ins.get('text', str(ins))}")
 
         sentences = search_results.get("sentences") or []
         if sentences:

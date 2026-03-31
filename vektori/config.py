@@ -41,7 +41,6 @@ class VektoriConfig:
 
     # Extraction limits (per extraction batch)
     max_facts: int = 15                 # max facts the LLM may return per session (prompt-level)
-    max_insights: int = 3               # max insights per cross-session run (prompt-level)
 
     # Token-threshold batching — fire extraction once buffered input exceeds this
     token_batch_threshold: int = 800    # ~800 tokens ≈ 3-4 turns before extraction fires

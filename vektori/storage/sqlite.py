@@ -98,18 +98,6 @@ class SQLiteBackend(StorageBackend):
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
-            CREATE TABLE IF NOT EXISTS insights (
-                id TEXT PRIMARY KEY,
-                text TEXT NOT NULL,
-                embedding TEXT,
-                user_id TEXT NOT NULL,
-                agent_id TEXT,
-                confidence REAL DEFAULT 1.0,
-                is_active INTEGER DEFAULT 1,
-                metadata TEXT DEFAULT '{}',
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
             CREATE TABLE IF NOT EXISTS sentence_edges (
                 source_id TEXT NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
                 target_id TEXT NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
@@ -125,18 +113,6 @@ class SQLiteBackend(StorageBackend):
                 PRIMARY KEY (fact_id, sentence_id)
             );
 
-            CREATE TABLE IF NOT EXISTS insight_sources (
-                insight_id TEXT NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-                sentence_id TEXT NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
-                PRIMARY KEY (insight_id, sentence_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS insight_facts (
-                insight_id TEXT NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-                fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
-                PRIMARY KEY (insight_id, fact_id)
-            );
-
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
@@ -150,8 +126,6 @@ class SQLiteBackend(StorageBackend):
             CREATE INDEX IF NOT EXISTS idx_sentences_session ON sentences (session_id);
             CREATE INDEX IF NOT EXISTS idx_facts_user ON facts (user_id);
             CREATE INDEX IF NOT EXISTS idx_facts_active ON facts (user_id, is_active);
-            CREATE INDEX IF NOT EXISTS idx_insights_user ON insights (user_id);
-            CREATE INDEX IF NOT EXISTS idx_insight_facts_fact ON insight_facts (fact_id);
             CREATE INDEX IF NOT EXISTS idx_fact_sources_fact ON fact_sources (fact_id);
         """)
 
@@ -400,104 +374,6 @@ class SQLiteBackend(StorageBackend):
                 break
         return chain
 
-    # ── Insights ──
-
-    async def insert_insight(
-        self,
-        text: str,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        confidence: float = 1.0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        insight_id = str(uuid.uuid4())
-        await self._conn.execute(
-            """INSERT INTO insights (id, text, embedding, user_id, agent_id, confidence, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (insight_id, text, json.dumps(embedding), user_id, agent_id,
-             confidence, json.dumps(metadata or {})),
-        )
-        await self._conn.commit()
-        return insight_id
-
-    async def search_insights(
-        self,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Brute-force cosine search over insights for a user."""
-        async with self._conn.execute(
-            "SELECT * FROM insights WHERE user_id = ? AND is_active = 1",
-            (user_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        results = []
-        for row in rows:
-            row_dict = dict(row)
-            emb = json.loads(row_dict["embedding"])
-            sim = _cosine_similarity(embedding, emb)
-            results.append({**row_dict, "distance": 1.0 - sim})
-        results.sort(key=lambda x: x["distance"])
-        return results[:limit]
-
-    async def get_facts_from_insights(
-        self,
-        insight_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Graph traversal: find all facts linked to any of the given insights."""
-        if not insight_ids:
-            return []
-        placeholders = ",".join("?" * len(insight_ids))
-        query = f"""
-            SELECT DISTINCT f.* FROM facts f
-            JOIN insight_facts inf ON f.id = inf.fact_id
-            WHERE inf.insight_id IN ({placeholders})
-              AND f.user_id = ?
-        """
-        if active_only:
-            query += " AND f.is_active = 1"
-        async with self._conn.execute(query, (*insight_ids, user_id)) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def get_insights_from_facts(
-        self,
-        fact_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        if not fact_ids:
-            return []
-        placeholders = ",".join("?" * len(fact_ids))
-        query = f"""
-            SELECT DISTINCT i.* FROM insights i
-            JOIN insight_facts inf ON i.id = inf.insight_id
-            WHERE inf.fact_id IN ({placeholders})
-              AND i.user_id = ?
-        """
-        if active_only:
-            query += " AND i.is_active = 1"
-        async with self._conn.execute(query, (*fact_ids, user_id)) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def get_active_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        async with self._conn.execute(
-            "SELECT * FROM insights WHERE user_id = ? AND is_active = 1",
-            (user_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
     # ── Edges ──
 
     async def insert_edges(self, edges: list[dict[str, Any]]) -> int:
@@ -537,20 +413,6 @@ class SQLiteBackend(StorageBackend):
         await self._conn.execute(
             "INSERT OR IGNORE INTO fact_sources (fact_id, sentence_id) VALUES (?, ?)",
             (fact_id, sentence_id),
-        )
-        await self._conn.commit()
-
-    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
-        await self._conn.execute(
-            "INSERT OR IGNORE INTO insight_facts (insight_id, fact_id) VALUES (?, ?)",
-            (insight_id, fact_id),
-        )
-        await self._conn.commit()
-
-    async def insert_insight_source(self, insight_id: str, sentence_id: str) -> None:
-        await self._conn.execute(
-            "INSERT OR IGNORE INTO insight_sources (insight_id, sentence_id) VALUES (?, ?)",
-            (insight_id, sentence_id),
         )
         await self._conn.commit()
 
@@ -642,7 +504,7 @@ class SQLiteBackend(StorageBackend):
 
     async def delete_user(self, user_id: str) -> int:
         count = 0
-        for table in ["sentences", "facts", "insights", "sessions"]:
+        for table in ["sentences", "facts", "sessions"]:
             async with self._conn.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE user_id = ?", (user_id,)
             ) as cursor:

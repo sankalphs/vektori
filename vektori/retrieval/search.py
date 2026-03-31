@@ -24,11 +24,10 @@ class SearchPipeline:
         Vector search over facts. Entry point for all retrieval.
         Facts are short and crisp → best cosine match for direct queries.
 
-    L1 — Facts + Insights + Source Sentences (~300-800 tokens):
-        Facts + insights via graph traversal + the exact sentences each fact
-        was extracted from (via fact_sources). No context expansion — just the
-        precise moments in conversation that produced the facts.
-        This is the default depth.
+    L1 — Facts + Source Sentences (~300-800 tokens):
+        Facts + the exact sentences each fact was extracted from (via fact_sources).
+        No context expansion — just the precise moments in conversation that produced
+        the facts. This is the default depth.
 
     L2 — Full story (~1000-3000 tokens):
         Everything in L1, plus full session context window (±N sentences around
@@ -102,8 +101,7 @@ class SearchPipeline:
         Returns:
             {
               "facts":        list[dict],  # always present
-              "insights":     list[dict],  # l1 and l2 only
-              "sentences":    list[dict],  # l2 only
+              "sentences":    list[dict],  # l1, l2 only
               "memory_found": bool,        # False when no facts passed min_score (abstention signal)
             }
 
@@ -194,7 +192,7 @@ class SearchPipeline:
             )
             if depth == "l0":
                 return {"facts": [], "memory_found": False}
-            return {"facts": [], "insights": [], "sentences": direct_sentences, "memory_found": False}
+            return {"facts": [], "sentences": direct_sentences, "memory_found": False}
 
         scored_facts = score_and_rank(
             seed_facts,
@@ -214,21 +212,8 @@ class SearchPipeline:
             top = _clean(scored_facts[:top_k])
             return {"facts": top, "memory_found": len(top) > 0}
 
-        # ── Step 2: Discover session INSIGHTS via graph traversal ─────────────
-        # NOT vector search — JOIN insight_facts WHERE fact_id IN seed_fact_ids.
-        # Insights are generated per-session from these exact facts, so this
-        # traversal surfaces the session-level summaries that ground the results.
+        # ── Step 2: Trace facts → source sentences ────────────────────────────
         seed_fact_ids = [f["id"] for f in scored_facts[:top_k]]
-        related_insights = await self.db.get_insights_from_facts(
-            fact_ids=seed_fact_ids,
-            user_id=user_id,
-            active_only=True,
-        )
-
-        # Propagate max linked-fact score to insights so they're relevance-ordered
-        related_insights = _score_insights(related_insights, scored_facts[:top_k])
-
-        # ── Step 3: Trace facts → source sentences ────────────────────────────
         source_sentence_ids = await self.db.get_source_sentences(seed_fact_ids)
 
         top_facts = _clean(scored_facts[:top_k])
@@ -255,7 +240,6 @@ class SearchPipeline:
         if not all_candidate_ids:
             return {
                 "facts": top_facts,
-                "insights": related_insights,
                 "sentences": [],
                 "memory_found": memory_found,
             }
@@ -308,7 +292,6 @@ class SearchPipeline:
 
         return {
             "facts": top_facts,
-            "insights": related_insights,
             "sentences": _dedup(result_sentences),
             "memory_found": memory_found,
         }
@@ -354,11 +337,9 @@ class SearchPipeline:
                 logger.debug(explain_score(f))
 
         top_facts = _clean(scored_facts[:top_k])
-        insights = _score_insights(raw.get("insights", []), scored_facts[:top_k])
 
         return {
             "facts": top_facts,
-            "insights": insights,
             "sentences": _dedup(raw.get("sentences", [])),
             "memory_found": len(top_facts) > 0,
         }
@@ -382,16 +363,15 @@ class SearchPipeline:
             → concurrent search_facts() per embedding          (L0 × N)
             → merge by fact ID, keep min distance per fact
             → score_and_rank(merged_facts)
-            → get_insights_from_facts(top_fact_ids)            (L1 graph)
             → get_source_sentences(top_fact_ids)               (L1 graph)
-            → return {facts, insights, sentences}
+            → return {facts, sentences}
 
         Always returns L1 depth. L2 context expansion is intentionally excluded
         — expansion already widens fact recall; adding window expansion on top
         would be redundant and expensive.
         """
         if not queries:
-            return {"facts": [], "insights": [], "sentences": [], "memory_found": False}
+            return {"facts": [], "sentences": [], "memory_found": False}
 
         # Single embed_batch call for all query variants
         embeddings = await self.embedder.embed_batch(queries)
@@ -429,7 +409,7 @@ class SearchPipeline:
 
         if not merged_facts:
             logger.debug("search_expanded: no facts found, falling back to sentence search")
-            return {"facts": [], "insights": [], "sentences": direct_sentences, "memory_found": False}
+            return {"facts": [], "sentences": direct_sentences, "memory_found": False}
 
         # Score the merged set
         scored_facts = score_and_rank(
@@ -447,14 +427,6 @@ class SearchPipeline:
 
         top_facts = scored_facts[:top_k]
         fact_ids = [f["id"] for f in top_facts]
-
-        # L1 graph traversal — runs ONCE on the full merged fact set
-        related_insights = await self.db.get_insights_from_facts(
-            fact_ids=fact_ids,
-            user_id=user_id,
-            active_only=True,
-        )
-        related_insights = _score_insights(related_insights, top_facts)
 
         source_sentence_ids = await self.db.get_source_sentences(fact_ids)
 
@@ -507,7 +479,6 @@ class SearchPipeline:
 
         return {
             "facts": _clean(top_facts),
-            "insights": related_insights,
             "sentences": _dedup(result_sentences),
             "memory_found": len(top_facts) > 0,
         }
@@ -537,7 +508,7 @@ class SearchPipeline:
             agent_id=agent_id,
             limit=top_k,
         )
-        return {"facts": [], "insights": [], "sentences": sentences, "memory_found": False}
+        return {"facts": [], "sentences": sentences, "memory_found": False}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -546,7 +517,6 @@ def _empty(depth: str) -> dict[str, Any]:
     """Return the correct empty structure for a given depth."""
     result: dict[str, Any] = {"facts": []}
     if depth in ("l1", "l2"):
-        result["insights"] = []
         result["sentences"] = []
     return result
 
@@ -573,37 +543,3 @@ def _dedup(sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def _score_insights(
-    insights: list[dict[str, Any]],
-    scored_facts: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Propagate max linked-fact score to insights and sort by relevance.
-
-    Insights are discovered via graph traversal from facts, not ranked by
-    vector similarity themselves. Propagating the max score of the facts
-    that link to each insight gives a principled relevance ordering:
-    if the insight was derived from a highly relevant fact, the insight
-    is more relevant to this query.
-    """
-    if not insights or not scored_facts:
-        return insights
-
-    # Build fact_id → score lookup
-    fact_scores: dict[str, float] = {f["id"]: f.get("score", 0.0) for f in scored_facts}
-
-    result = []
-    for ins in insights:
-        # insight_facts join returns fact_ids on the insight dict (if present)
-        linked_ids = ins.get("fact_ids") or []
-        if linked_ids:
-            max_fact_score = max(
-                (fact_scores.get(fid, 0.0) for fid in linked_ids), default=0.0
-            )
-        else:
-            # No explicit links — use global max of returned facts as fallback
-            max_fact_score = max(fact_scores.values(), default=0.0)
-        result.append({**ins, "score": round(max_fact_score, 6)})
-
-    result.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-    return result

@@ -118,7 +118,6 @@ def build_retrieval_context(
     result: dict[str, Any],
     *,
     include_facts: bool = True,
-    include_insights: bool = True,
     include_sentences: bool = True,
     mark_source_sentences: bool = True,
     show_role: bool = True,
@@ -134,9 +133,6 @@ def build_retrieval_context(
         ## Facts
         - <fact text>
 
-        ## Insights
-        - <insight text>
-
         ## Context
         [user] sentence... [*]
         [assistant] sentence...
@@ -148,7 +144,6 @@ def build_retrieval_context(
     Args:
         result: Return value from ``SearchPipeline.search()``.
         include_facts: Include the facts section.
-        include_insights: Include the insights section.
         include_sentences: Include the sentence context section.
         mark_source_sentences: Tag direct source sentences with ``[*]``.
         show_role: Prefix sentence lines with ``[user]``/``[assistant]``.
@@ -165,15 +160,6 @@ def build_retrieval_context(
             lines = ["## Facts"]
             for f in facts:
                 lines.append(f"- {f.get('text', '').strip()}")
-            sections.append("\n".join(lines))
-
-    # ── Insights ──────────────────────────────────────────────────────────────
-    if include_insights:
-        insights = result.get("insights", [])
-        if insights:
-            lines = ["## Insights"]
-            for i in insights:
-                lines.append(f"- {i.get('text', '').strip()}")
             sections.append("\n".join(lines))
 
     # ── Sentences (context window) ─────────────────────────────────────────────

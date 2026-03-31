@@ -82,31 +82,6 @@ CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts (user_id, subject) WHERE s
 
 
 -- ============================================================
--- INSIGHTS: The middle layer (L1). LLM-inferred cross-session patterns.
--- NOT a vector search target. Discovered via graph traversal from facts.
--- ============================================================
-CREATE TABLE IF NOT EXISTS insights (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    text TEXT NOT NULL,
-    embedding vector(1536),    -- stored but NOT indexed — not searched directly
-
-    user_id TEXT NOT NULL,
-    agent_id TEXT,
-
-    confidence FLOAT DEFAULT 1.0,
-    is_active BOOLEAN DEFAULT true,
-
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
-);
-
--- NOTE: No vector index on insights — they're discovered via graph, not search.
-CREATE INDEX IF NOT EXISTS idx_insights_user ON insights (user_id);
-CREATE INDEX IF NOT EXISTS idx_insights_user_agent ON insights (user_id, agent_id);
-
-
--- ============================================================
 -- EDGES: Typed relationships between sentences.
 -- 'next': sequential flow within a session
 -- 'contradiction': conflicting statements (optional, future use)
@@ -137,35 +112,6 @@ CREATE TABLE IF NOT EXISTS fact_sources (
 
 CREATE INDEX IF NOT EXISTS idx_fact_sources_fact ON fact_sources (fact_id);
 CREATE INDEX IF NOT EXISTS idx_fact_sources_sentence ON fact_sources (sentence_id);
-
-
--- ============================================================
--- INSIGHT_SOURCES: Links insights (L1) to source sentences (L2).
--- ============================================================
-CREATE TABLE IF NOT EXISTS insight_sources (
-    insight_id UUID NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-    sentence_id UUID NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
-    PRIMARY KEY (insight_id, sentence_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_insight_sources_insight ON insight_sources (insight_id);
-CREATE INDEX IF NOT EXISTS idx_insight_sources_sentence ON insight_sources (sentence_id);
-
-
--- ============================================================
--- INSIGHT_FACTS: Links insights (L1) to related facts (L0).
--- THE KEY BRIDGE.
--- Vector search finds facts → JOIN here → discovers insights.
--- This is how the insight layer is found without vector search.
--- ============================================================
-CREATE TABLE IF NOT EXISTS insight_facts (
-    insight_id UUID NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-    fact_id UUID NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
-    PRIMARY KEY (insight_id, fact_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_insight_facts_insight ON insight_facts (insight_id);
-CREATE INDEX IF NOT EXISTS idx_insight_facts_fact ON insight_facts (fact_id);
 
 
 -- ============================================================

@@ -14,15 +14,14 @@ class StorageBackend(ABC):
     Backends: SQLite (zero-config default), PostgreSQL+pgvector (production),
               Memory (unit tests / CI).
 
-    The interface maps directly to the three-layer graph schema:
+    The interface maps directly to the two-layer graph schema:
       - Facts (L0): LLM-extracted statements, primary vector search surface
-      - Insights (L1): inferred cross-session patterns, found via graph traversal
       - Sentences (L2): raw conversation nodes + NEXT edges (context expansion)
-      - Join tables: fact_sources (L0↔L2), insight_facts (L1↔L0), insight_sources (L1↔L2)
+      - Join tables: fact_sources (L0↔L2)
 
     Layer numbering matches SearchPipeline depth parameter:
       L0 — vector search over facts only
-      L1 — facts + insights (graph) + source sentences (no expansion)
+      L1 — facts + source sentences (no expansion)
       L2 — L1 + full session context window (±N expansion)
     """
 
@@ -172,63 +171,6 @@ class StorageBackend(ABC):
         """
         ...
 
-    # ── Insights ──
-
-    @abstractmethod
-    async def insert_insight(
-        self,
-        text: str,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        confidence: float = 1.0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        """Insert an insight and return its UUID."""
-        ...
-
-    @abstractmethod
-    async def search_insights(
-        self,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Vector search over insights. Results include a 'distance' field (cosine distance).
-        Primary entry point for L1/L2 retrieval — insights embed session-level semantics
-        more cleanly than raw facts."""
-        ...
-
-    @abstractmethod
-    async def get_facts_from_insights(
-        self,
-        insight_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Graph traversal: JOIN insight_facts WHERE insight_id IN (...).
-        Reverse of get_insights_from_facts — used to pull facts grounding matched insights."""
-        ...
-
-    @abstractmethod
-    async def get_insights_from_facts(
-        self,
-        fact_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Graph traversal: JOIN insight_facts WHERE fact_id IN (...). NOT vector search."""
-        ...
-
-    @abstractmethod
-    async def get_active_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        ...
-
     # ── Edges ──
 
     @abstractmethod
@@ -256,26 +198,6 @@ class StorageBackend(ABC):
         """Batch link facts to source sentences. Override for efficiency."""
         for fact_id, sentence_id in pairs:
             await self.insert_fact_source(fact_id, sentence_id)
-
-    @abstractmethod
-    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
-        """Link an insight to a related fact. This is the key L1↔L0 bridge."""
-        ...
-
-    async def insert_insight_facts(self, pairs: list[tuple[str, str]]) -> None:
-        """Batch link insights to related facts. Override for efficiency."""
-        for insight_id, fact_id in pairs:
-            await self.insert_insight_fact(insight_id, fact_id)
-
-    @abstractmethod
-    async def insert_insight_source(self, insight_id: str, sentence_id: str) -> None:
-        """Link an insight to a source sentence."""
-        ...
-
-    async def insert_insight_sources(self, pairs: list[tuple[str, str]]) -> None:
-        """Batch link insights to source sentences. Override for efficiency."""
-        for insight_id, sentence_id in pairs:
-            await self.insert_insight_source(insight_id, sentence_id)
 
     @abstractmethod
     async def get_source_sentences(self, fact_ids: list[str]) -> list[str]:
@@ -318,7 +240,7 @@ class StorageBackend(ABC):
         user_id: str,
         agent_id: str | None = None,
     ) -> int:
-        """Count distinct sessions for a user. Used to trigger cross-session insight generation."""
+        """Count distinct sessions for a user."""
         ...
 
     # ── Lifecycle ──

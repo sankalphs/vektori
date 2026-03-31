@@ -50,10 +50,10 @@ class PostgresBackend(StorageBackend):
     Notes:
         - Vector search via IVFFlat cosine index (switch to HNSW when >1M rows).
         - Embeddings passed as '[x,y,z]' strings; PostgreSQL casts via ::vector.
-        - All graph traversal (insight_facts, fact_sources) happens in SQL — no
+        - All graph traversal (fact_sources) happens in SQL — no
           application-level graph library needed.
         - The L2 fast path (search_l2_single_query) executes the full
-          facts→insights→sentences pipeline in one round trip.
+          facts→sentences pipeline in one round trip.
     """
 
     # Set to True so SearchPipeline can use the single-query L2 fast path.
@@ -431,135 +431,6 @@ class PostgresBackend(StorageBackend):
             rows = await conn.fetch(query, uuid.UUID(fact_id))
         return [_row(r) for r in rows]
 
-    # ── Insights ───────────────────────────────────────────────────────────────
-
-    async def insert_insight(
-        self,
-        text: str,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        confidence: float = 1.0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        self._check_dim(embedding, "insert_insight")
-        insight_id = uuid.uuid4()
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO insights
-                    (id, text, embedding, user_id, agent_id, confidence, metadata)
-                VALUES
-                    ($1, $2, $3::vector, $4, $5, $6, $7)
-                """,
-                insight_id,
-                text,
-                _vec(embedding),
-                user_id,
-                agent_id,
-                confidence,
-                json.dumps(metadata or {}),
-            )
-        return str(insight_id)
-
-    async def search_insights(
-        self,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """pgvector cosine search over insights for a user."""
-        query = """
-            SELECT id, text, confidence, is_active, created_at, metadata,
-                   embedding <=> $1::vector AS distance
-            FROM insights
-            WHERE user_id = $2
-              AND ($3::text IS NULL OR agent_id = $3)
-              AND is_active = true
-            ORDER BY embedding <=> $1::vector
-            LIMIT $4
-        """
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(query, _vec(embedding), user_id, agent_id, limit)
-        return [_row(r) for r in rows]
-
-    async def get_facts_from_insights(
-        self,
-        insight_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Graph traversal: find all facts linked to any of the given insights."""
-        if not insight_ids:
-            return []
-        uuid_ids = [uuid.UUID(iid) for iid in insight_ids]
-        query = """
-            SELECT DISTINCT f.id, f.text, f.embedding, f.user_id, f.agent_id,
-                            f.session_id, f.subject, f.confidence, f.is_active,
-                            f.superseded_by, f.metadata, f.event_time,
-                            f.mentions, f.created_at
-            FROM facts f
-            INNER JOIN insight_facts inf ON f.id = inf.fact_id
-            WHERE inf.insight_id = ANY($1::uuid[])
-              AND f.user_id = $2
-              AND ($3::boolean = false OR f.is_active = true)
-        """
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(query, uuid_ids, user_id, active_only)
-        return [_row(r) for r in rows]
-
-    async def get_insights_from_facts(
-        self,
-        fact_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Graph traversal: find all insights linked to any of the given facts.
-
-        This is the core L1 discovery mechanism — NOT vector search.
-        user_id scoping is a safety guard; fact UUIDs are globally unique,
-        but this prevents any data leak if that assumption ever breaks.
-        """
-        if not fact_ids:
-            return []
-
-        uuid_ids = [uuid.UUID(fid) for fid in fact_ids]
-        query = """
-            SELECT DISTINCT i.id, i.text, i.confidence, i.is_active,
-                            i.created_at, i.metadata
-            FROM insights i
-            INNER JOIN insight_facts inf ON i.id = inf.insight_id
-            WHERE inf.fact_id = ANY($1::uuid[])
-              AND i.user_id = $2
-              AND ($3::boolean = false OR i.is_active = true)
-            ORDER BY i.created_at DESC
-        """
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(query, uuid_ids, user_id, active_only)
-        return [_row(r) for r in rows]
-
-    async def get_active_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        query = """
-            SELECT id, text, confidence, is_active, created_at, metadata
-            FROM insights
-            WHERE user_id = $1
-              AND ($2::text IS NULL OR agent_id = $2)
-              AND is_active = true
-            ORDER BY created_at DESC
-            LIMIT $3
-            OFFSET $4
-        """
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(query, user_id, agent_id, limit, offset)
-        return [_row(r) for r in rows]
-
     # ── Edges ──────────────────────────────────────────────────────────────────
 
     async def insert_edges(self, edges: list[dict[str, Any]]) -> int:
@@ -644,40 +515,6 @@ class PostgresBackend(StorageBackend):
                 ON CONFLICT DO NOTHING
                 """,
                 [(uuid.UUID(f), uuid.UUID(s)) for f, s in pairs],
-            )
-
-    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
-        await self.insert_insight_facts([(insight_id, fact_id)])
-
-    async def insert_insight_facts(self, pairs: list[tuple[str, str]]) -> None:
-        """Batch link insights to related facts."""
-        if not pairs:
-            return
-        async with self._pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO insight_facts (insight_id, fact_id)
-                VALUES ($1, $2)
-                ON CONFLICT DO NOTHING
-                """,
-                [(uuid.UUID(i), uuid.UUID(f)) for i, f in pairs],
-            )
-
-    async def insert_insight_source(self, insight_id: str, sentence_id: str) -> None:
-        await self.insert_insight_sources([(insight_id, sentence_id)])
-
-    async def insert_insight_sources(self, pairs: list[tuple[str, str]]) -> None:
-        """Batch link insights to source sentences."""
-        if not pairs:
-            return
-        async with self._pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO insight_sources (insight_id, sentence_id)
-                VALUES ($1, $2)
-                ON CONFLICT DO NOTHING
-                """,
-                [(uuid.UUID(i), uuid.UUID(s)) for i, s in pairs],
             )
 
     async def get_source_sentences(self, fact_ids: list[str]) -> list[str]:
@@ -769,10 +606,9 @@ class PostgresBackend(StorageBackend):
     ) -> dict[str, list[dict[str, Any]]]:
         """Execute the full L2 retrieval in one round trip via a CTE.
 
-        facts → insights (via insight_facts) → source sentences (via fact_sources)
-        → session expansion (±window by sentence_index).
+        facts → source sentences (via fact_sources) → session expansion (±window by sentence_index).
 
-        This is meaningfully faster than 4 separate queries at scale.
+        This is meaningfully faster than 3 separate queries at scale.
         Called by SearchPipeline when backend.supports_single_query is True.
         subject: pre-filter facts to a specific entity before vector scan.
         session_id: scope retrieval to a specific session's facts.
@@ -796,17 +632,7 @@ class PostgresBackend(StorageBackend):
                 LIMIT $6
             ),
 
-            -- Step 2: Insights linked to matched facts (L1)
-            -- Graph traversal via insight_facts — NOT vector search.
-            related_insights AS (
-                SELECT DISTINCT i.id, i.text, i.confidence, i.created_at, i.metadata
-                FROM insights i
-                INNER JOIN insight_facts inf ON i.id = inf.insight_id
-                WHERE inf.fact_id IN (SELECT id FROM seed_facts)
-                  AND i.is_active = true
-            ),
-
-            -- Step 3: Source sentences for matched facts
+            -- Step 2: Source sentences for matched facts
             source_sentences AS (
                 SELECT DISTINCT s.id, s.text, s.session_id, s.turn_number,
                                 s.sentence_index, s.role, s.created_at
@@ -816,7 +642,7 @@ class PostgresBackend(StorageBackend):
                   AND s.is_active = true
             ),
 
-            -- Step 4: Session expansion (±window around each source sentence)
+            -- Step 3: Session expansion (±window around each source sentence)
             expanded_sentences AS (
                 SELECT DISTINCT s2.id, s2.text, s2.session_id, s2.turn_number,
                                 s2.sentence_index, s2.role, s2.created_at
@@ -829,14 +655,10 @@ class PostgresBackend(StorageBackend):
                 WHERE s2.is_active = true
             )
 
-            -- Return all three layers tagged by type
+            -- Return both layers tagged by type
             SELECT 'fact'     AS layer, id, text, confidence, created_at,
                               metadata::text, distance
             FROM seed_facts
-            UNION ALL
-            SELECT 'insight'  AS layer, id, text, confidence, created_at,
-                              metadata::text, NULL AS distance
-            FROM related_insights
             UNION ALL
             SELECT 'sentence' AS layer, id, text, NULL AS confidence, created_at,
                               NULL AS metadata, NULL AS distance
@@ -857,7 +679,6 @@ class PostgresBackend(StorageBackend):
             )
 
         facts: list[dict[str, Any]] = []
-        insights: list[dict[str, Any]] = []
         sentences: list[dict[str, Any]] = []
 
         for row in rows:
@@ -865,24 +686,21 @@ class PostgresBackend(StorageBackend):
             layer = d.pop("layer")
             if layer == "fact":
                 facts.append(d)
-            elif layer == "insight":
-                d.pop("distance", None)
-                insights.append(d)
             else:
                 d.pop("distance", None)
                 d.pop("confidence", None)
                 sentences.append(d)
 
-        return {"facts": facts, "insights": insights, "sentences": sentences}
+        return {"facts": facts, "sentences": sentences}
 
     # ── GDPR ───────────────────────────────────────────────────────────────────
 
     async def delete_user(self, user_id: str) -> int:
         """Cascade delete all data for a user.
 
-        FK cascades in the schema handle sentence_edges, fact_sources,
-        insight_sources, insight_facts automatically when the parent rows are
-        deleted. Wrapped in a transaction so partial deletes can't happen.
+        FK cascades in the schema handle sentence_edges, fact_sources
+        automatically when the parent rows are deleted.
+        Wrapped in a transaction so partial deletes can't happen.
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -891,7 +709,6 @@ class PostgresBackend(StorageBackend):
                     SELECT
                         (SELECT COUNT(*) FROM sentences WHERE user_id = $1) +
                         (SELECT COUNT(*) FROM facts    WHERE user_id = $1) +
-                        (SELECT COUNT(*) FROM insights WHERE user_id = $1) +
                         (SELECT COUNT(*) FROM sessions WHERE user_id = $1) AS total
                     """,
                     user_id,
@@ -899,7 +716,6 @@ class PostgresBackend(StorageBackend):
                 total = counts["total"] if counts else 0
                 await conn.execute("DELETE FROM sentences WHERE user_id = $1", user_id)
                 await conn.execute("DELETE FROM facts    WHERE user_id = $1", user_id)
-                await conn.execute("DELETE FROM insights WHERE user_id = $1", user_id)
                 await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
 
         logger.info("Deleted %d rows for user %s", total, user_id)

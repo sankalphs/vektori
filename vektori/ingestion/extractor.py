@@ -62,52 +62,16 @@ General:
 Return ONLY the JSON."""
 
 
-CROSS_SESSION_INSIGHTS_PROMPT = """Analyze facts across multiple sessions to extract CROSS-SESSION PATTERNS about the USER.
-
-FACTS BY SESSION (each fact has a stable ID and a source tag — [user] or [assistant]):
-{facts_by_session}
-
-EXISTING INSIGHTS (do not repeat or rephrase these):
-{existing_insights}
-
-Return JSON:
-{{
-  "insights": [
-    {{
-      "text": "actionable pattern — must have evidence from 2+ different sessions",
-      "confidence": 0.80,
-      "derived_from_fact_ids": ["F3", "F7"]
-    }}
-  ]
-}}
-
-Rules:
-- Only extract patterns with clear evidence spanning 2+ sessions
-- Must be actionable — what should the agent do differently because of this?
-- Insights are about USER patterns and preferences. [assistant] facts may be used as supporting evidence (e.g. user keeps asking about X → assistant keeps addressing X) but must never be the sole basis of an insight
-- Do not repeat, rephrase, or contradict anything in EXISTING INSIGHTS
-- derived_from_fact_ids must reference IDs from the list above
-- Extract at most {max_insights} insights
-- If no clear cross-session pattern exists, return {{"insights": []}}
-
-Return ONLY the JSON."""
-
-
 # ── Extractor ─────────────────────────────────────────────────────────────────
 
 class FactExtractor:
     """
-    Extracts facts (L0) and insights (L1) from conversations using an LLM.
+    Extracts facts (L0) from conversations using an LLM.
 
     One LLM call per session (facts only):
       - No existing facts sent to LLM — avoids token explosion and hallucination feedback loops
       - No `contradicts` field — deduplication runs in code via embedding similarity
         after each fact batch is embedded, using the same vectors already computed for storage
-
-    Cross-session insights (separate, triggered every Nth session):
-      - Facts grouped by session with stable IDs ([F1], [F2], ...)
-      - LLM returns derived_from_fact_ids — ID-based, no fragile text matching
-      - Existing insights passed in to prevent duplication
 
     Write-time semantic dedup:
       - Same session + sim > 0.92 → skip insert, increment mentions on existing
@@ -122,7 +86,6 @@ class FactExtractor:
         embedder: EmbeddingProvider,
         llm: LLMProvider,
         max_facts: int = 8,
-        max_insights: int = 3,
         max_input_tokens: int = 4000,
         max_output_tokens: int = 8192,
     ) -> None:
@@ -130,7 +93,6 @@ class FactExtractor:
         self.embedder = embedder
         self.llm = llm
         self.max_facts = max_facts
-        self.max_insights = max_insights
         # ~4 chars/token → 4000 tokens ≈ 16k chars per chunk
         # Long conversations are chunked (not truncated) so facts are extracted
         # from the full history, not just the most recent window.
@@ -146,12 +108,10 @@ class FactExtractor:
         sentence_ids: list[str] | None = None,
         session_time: datetime | None = None,
         _capture_out: list[dict[str, Any]] | None = None,
-        _skip_cross_session: bool = False,
     ) -> dict[str, Any]:
         """
         One LLM call: extract facts, run dedup in code, link to sentences.
         Returns {"facts_inserted": N}.
-        Cross-session insights trigger every 3rd session.
 
         session_time: when the conversation happened (session started_at).
         Stored as event_time on each fact for temporal filtering at retrieval.
@@ -174,15 +134,6 @@ class FactExtractor:
             new_facts, session_id, user_id, agent_id, conversation, session_time,
             _capture_out=_capture_out,
         )
-
-        # ── Cross-session trigger: every 3rd session ──
-        if not _skip_cross_session:
-            try:
-                session_count = await self.db.count_sessions(user_id, agent_id)
-                if session_count % 3 == 0 and session_count > 1:
-                    await self.extract_cross_session_insights(user_id, agent_id)
-            except Exception as e:
-                logger.warning("Cross-session insight trigger failed: %s", e)
 
         logger.info("Extraction complete for session %s: %d facts", session_id, facts_inserted)
         return {"facts_inserted": facts_inserted}
@@ -518,104 +469,6 @@ class FactExtractor:
 
         return linked_ids
 
-    # ── Cross-session ─────────────────────────────────────────────────────────
-
-    async def extract_cross_session_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> dict[str, Any]:
-        """
-        Analyze facts across all sessions to find cross-session patterns.
-        Called automatically every 3rd session, or manually via client.generate_insights().
-
-        Facts are given stable IDs ([F1], [F2], ...) in the prompt so the LLM returns
-        derived_from_fact_ids — ID-based linking, no fragile text matching.
-        Existing insights are passed in to prevent duplication.
-        """
-        all_facts = await self.db.get_active_facts(user_id, agent_id, limit=200)
-        if not all_facts:
-            return {"insights_inserted": 0}
-
-        # Build stable ID map: "F1" → fact dict
-        fact_id_map: dict[str, dict[str, Any]] = {
-            f"F{i + 1}": fact for i, fact in enumerate(all_facts)
-        }
-
-        # Group by session for the prompt — include source tag so insights LLM
-        # knows which facts came from the user vs. the assistant
-        facts_by_session: dict[str, list[str]] = {}
-        for fid, fact in fact_id_map.items():
-            sid = fact.get("session_id") or "unknown"
-            meta_raw = fact.get("metadata") or "{}"
-            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
-            source = meta.get("source", "user")
-            facts_by_session.setdefault(sid, []).append(f"[{fid}][{source}] {fact['text']}")
-
-        if len(facts_by_session) < 2:
-            return {"insights_inserted": 0}
-
-        session_summary = "\n".join(
-            f"Session {sid}:\n" + "\n".join(f"  {line}" for line in lines)
-            for sid, lines in facts_by_session.items()
-        )
-
-        # Fetch existing insights for dedup
-        existing_insights = await self.db.get_active_insights(user_id, agent_id)
-        existing_text = (
-            "\n".join(f"- {ins['text']}" for ins in existing_insights)
-            if existing_insights else "None yet."
-        )
-
-        prompt = CROSS_SESSION_INSIGHTS_PROMPT.format(
-            facts_by_session=session_summary,
-            existing_insights=existing_text,
-            max_insights=self.max_insights,
-        )
-
-        try:
-            response = await self.llm.generate(prompt, max_tokens=self._max_output_tokens)
-            insight_list = _parse_json_response(response).get("insights", [])
-        except Exception as e:
-            logger.error("Cross-session extraction failed: %s", e)
-            return {"insights_inserted": 0, "error": str(e)}
-
-        insights_inserted = 0
-
-        # Batch embed insight texts
-        if insight_list:
-            insight_texts = [ins["text"] for ins in insight_list]
-            try:
-                insight_embeddings = await self.embedder.embed_batch(insight_texts)
-            except Exception as e:
-                logger.error("Batch embed failed for insights: %s", e)
-                return {"insights_inserted": 0, "error": str(e)}
-
-            for insight_data, insight_embedding in zip(insight_list, insight_embeddings):
-                try:
-                    insight_id = await self.db.insert_insight(
-                        text=insight_data["text"],
-                        embedding=insight_embedding,
-                        user_id=user_id,
-                        agent_id=agent_id,
-                        confidence=insight_data.get("confidence", 1.0),
-                    )
-                    insights_inserted += 1
-
-                    # ID-based linking — no text matching, no paraphrase failures
-                    for fid in insight_data.get("derived_from_fact_ids", []):
-                        fact = fact_id_map.get(fid)
-                        if fact:
-                            await self.db.insert_insight_fact(insight_id, fact["id"])
-
-                except Exception as e:
-                    logger.warning("Failed to insert cross-session insight: %s", e)
-
-        logger.info(
-            "Cross-session extraction for user %s: %d insights", user_id, insights_inserted
-        )
-        return {"insights_inserted": insights_inserted}
-
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -631,4 +484,4 @@ def _parse_json_response(response: str) -> dict[str, Any]:
         return json.loads(text)
     except json.JSONDecodeError as e:
         logger.error("Failed to parse extraction JSON: %s\nResponse: %.500s", e, response)
-        return {"facts": [], "insights": []}
+        return {"facts": []}

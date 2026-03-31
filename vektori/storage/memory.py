@@ -29,11 +29,8 @@ class MemoryBackend(StorageBackend):
     def __init__(self) -> None:
         self._sentences: dict[str, dict[str, Any]] = {}
         self._facts: dict[str, dict[str, Any]] = {}
-        self._insights: dict[str, dict[str, Any]] = {}
         self._edges: list[dict[str, Any]] = []
         self._fact_sources: list[dict[str, str]] = []       # [{fact_id, sentence_id}]
-        self._insight_facts: list[dict[str, str]] = []      # [{insight_id, fact_id}]
-        self._insight_sources: list[dict[str, str]] = []    # [{insight_id, sentence_id}]
         self._sessions: dict[str, dict[str, Any]] = {}
 
     async def initialize(self) -> None:
@@ -247,105 +244,6 @@ class MemoryBackend(StorageBackend):
                 break
         return chain
 
-    # ── Insights ──
-
-    async def insert_insight(
-        self,
-        text: str,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        confidence: float = 1.0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        insight_id = str(uuid.uuid4())
-        self._insights[insight_id] = {
-            "id": insight_id,
-            "text": text,
-            "embedding": embedding,
-            "user_id": user_id,
-            "agent_id": agent_id,
-            "confidence": confidence,
-            "is_active": True,
-            "metadata": metadata or {},
-            "created_at": datetime.utcnow(),
-        }
-        return insight_id
-
-    async def search_insights(
-        self,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """In-memory cosine search over insights for a user."""
-        results = []
-        for ins in self._insights.values():
-            if ins.get("user_id") != user_id:
-                continue
-            if not ins.get("is_active", True):
-                continue
-            if ins.get("embedding") is None:
-                continue
-            sim = _cosine_similarity(embedding, ins["embedding"])
-            results.append({**ins, "distance": 1.0 - sim})
-        results.sort(key=lambda x: x["distance"])
-        return results[:limit]
-
-    async def get_facts_from_insights(
-        self,
-        insight_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Graph traversal: find all facts linked to any of the given insights."""
-        insight_id_set = set(insight_ids)
-        fact_ids = {
-            link["fact_id"]
-            for link in self._insight_facts
-            if link["insight_id"] in insight_id_set
-        }
-        results = []
-        for fid in fact_ids:
-            fact = self._facts.get(fid)
-            if fact and fact.get("user_id") == user_id and (
-                not active_only or fact.get("is_active", True)
-            ):
-                results.append(fact)
-        return results
-
-    async def get_insights_from_facts(
-        self,
-        fact_ids: list[str],
-        user_id: str,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        fact_id_set = set(fact_ids)
-        insight_ids = {
-            link["insight_id"]
-            for link in self._insight_facts
-            if link["fact_id"] in fact_id_set
-        }
-        results = []
-        for iid in insight_ids:
-            insight = self._insights.get(iid)
-            if insight and insight.get("user_id") == user_id and (
-                not active_only or insight.get("is_active", True)
-            ):
-                results.append(insight)
-        return results
-
-    async def get_active_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        return [
-            i for i in self._insights.values()
-            if i.get("user_id") == user_id and i.get("is_active", True)
-        ]
-
     # ── Edges ──
 
     async def insert_edges(self, edges: list[dict[str, Any]]) -> int:
@@ -381,12 +279,6 @@ class MemoryBackend(StorageBackend):
 
     async def insert_fact_source(self, fact_id: str, sentence_id: str) -> None:
         self._fact_sources.append({"fact_id": fact_id, "sentence_id": sentence_id})
-
-    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
-        self._insight_facts.append({"insight_id": insight_id, "fact_id": fact_id})
-
-    async def insert_insight_source(self, insight_id: str, sentence_id: str) -> None:
-        self._insight_sources.append({"insight_id": insight_id, "sentence_id": sentence_id})
 
     async def get_source_sentences(self, fact_ids: list[str]) -> list[str]:
         fact_id_set = set(fact_ids)
@@ -459,7 +351,7 @@ class MemoryBackend(StorageBackend):
 
     async def delete_user(self, user_id: str) -> int:
         count = 0
-        for store in [self._sentences, self._facts, self._insights, self._sessions]:
+        for store in [self._sentences, self._facts, self._sessions]:
             keys = [k for k, v in store.items() if v.get("user_id") == user_id]
             for k in keys:
                 del store[k]

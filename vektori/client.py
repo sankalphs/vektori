@@ -89,7 +89,6 @@ class Vektori:
             embedder=self.embedder,
             llm=self.llm,
             max_facts=self.config.max_facts,
-            max_insights=self.config.max_insights,
             max_input_tokens=self.config.max_extraction_input_tokens,
             max_output_tokens=self.config.max_extraction_output_tokens,
         )
@@ -177,7 +176,6 @@ class Vektori:
         Returns:
             {
               "facts": [...],
-              "insights": [...],        # l1, l2, and expand=True
               "sentences": [...]        # l1, l2, and expand=True
             }
         """
@@ -189,7 +187,6 @@ class Vektori:
                 logger.debug("Retrieval gate: skipping DB lookup for query=%r", query[:60])
                 result: dict[str, Any] = {"facts": []}
                 if depth in ("l1", "l2") or expand:
-                    result["insights"] = []
                     result["sentences"] = []
                 return result
 
@@ -224,15 +221,6 @@ class Vektori:
         await self._ensure_initialized()
         return await self.db.get_active_facts(user_id, agent_id)
 
-    async def get_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Get all active insights for a user."""
-        await self._ensure_initialized()
-        return await self.db.get_active_insights(user_id, agent_id)
-
     async def get_session(
         self,
         session_id: str,
@@ -255,15 +243,6 @@ class Vektori:
         """Delete all data for a user (GDPR). Returns number of rows deleted."""
         await self._ensure_initialized()
         return await self.db.delete_user(user_id)
-
-    async def generate_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Manually trigger cross-session insight generation for a user."""
-        await self._ensure_initialized()
-        return await self._extractor.extract_cross_session_insights(user_id, agent_id)
 
     async def close(self) -> None:
         """Close database connections and gracefully shut down background workers."""
