@@ -7,9 +7,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](YOUR_DISCORD_LINK)
 
-<!-- DEMO PLACEHOLDER — replace with a GIF or video showing add → search → facts + insights output -->
+<!-- DEMO PLACEHOLDER — replace with a GIF or video showing add → search → facts + episodes output -->
 <!-- ![Vektori Demo](assets/demo.gif) -->
-> 📹 **Demo coming soon** — add → search → facts + insights, in under 5 seconds.
+> 📹 **Demo coming soon** — add → search → facts + episodes, in under 5 seconds.
 
 ---
 
@@ -21,13 +21,23 @@ Most memory systems compress conversations into entity-relationship triples. You
 ```
 FACT LAYER (L0)      ← vector search surface. Short, crisp statements.
         ↕
-INSIGHT LAYER (L1)   ← cross-session patterns, auto-discovered via graph traversal.
+EPISODE LAYER (L1)   ← patterns auto-discovered via graph traversal.
         ↕
 SENTENCE LAYER (L2)  ← raw conversation. Sequential NEXT edges. The full story.
 ```
 
-Search hits Facts → graph discovers Insights → traces back to source Sentences.
+Search hits Facts → graph discovers Episodes → traces back to source Sentences.
 One database. Postgres or SQLite. No Neo4j. No Qdrant. No infra drama.
+
+---
+
+## Benchmarks
+
+| Benchmark | Score | Depth | Models |
+|-----------|-------|-------|--------|
+| LongMemEval-S | **73%** | L1 | BGE-M3 + Gemini Flash |
+
+Still improving — run your own in [`/benchmarks`](benchmarks/).
 
 ---
 
@@ -66,13 +76,13 @@ async def main():
     results = await v.search(
         query="How does this user prefer to communicate?",
         user_id="user-123",
-        depth="l1",  # facts + cross-session insights
+        depth="l1",  # facts + episodes
     )
 
     for fact in results["facts"]:
         print(f"[{fact['score']:.2f}] {fact['text']}")
     for insight in results["insights"]:
-        print(f"insight: {insight['text']}")
+        print(f"episode: {insight['text']}")
 
     await v.close()
 
@@ -83,7 +93,7 @@ asyncio.run(main())
 ```
 [0.94] User prefers WhatsApp communication
 [0.81] Outstanding balance of ₹45,000, payment expected Friday
-insight: User consistently avoids email — route all comms to WhatsApp
+episode: User consistently avoids email — route all comms to WhatsApp
 ```
 
 ---
@@ -95,14 +105,14 @@ Pick how deep you want to go. Pay only for what you need.
 | Depth | Returns | ~Tokens | When to use |
 |-------|---------|---------|-------------|
 | `l0`  | Facts only | 50–200 | Fast lookup, agent planning, tool calls |
-| `l1`  | Facts + Insights | 200–500 | **Default.** Full answer with context |
-| `l2`  | Facts + Insights + raw Sentences | 1000–3000 | Trajectory analysis, full story replay |
+| `l1`  | Facts + Episodes | 200–500 | **Default.** Full answer with context |
+| `l2`  | Facts + Episodes + raw Sentences | 1000–3000 | Trajectory analysis, full story replay |
 
 ```python
 # Just the facts — cheapest, fastest
 results = await v.search(query, user_id, depth="l0")
 
-# Facts + cross-session patterns (recommended)
+# Facts + episodes (recommended)
 results = await v.search(query, user_id, depth="l1")
 
 # Everything — with surrounding conversation context
@@ -139,12 +149,12 @@ async def chat(user_id: str):
         # 1. Pull relevant memory
         mem = await v.search(query=user_input, user_id=user_id, depth="l1")
         facts = "\n".join(f"- {f['text']}" for f in mem.get("facts", []))
-        insights = "\n".join(f"- {i['text']}" for i in mem.get("insights", []))
+        episodes = "\n".join(f"- {i['text']}" for i in mem.get("insights", []))
 
         # 2. Inject into system prompt
         system = "You are a helpful assistant with memory.\n"
         if facts:    system += f"\nKnown facts:\n{facts}"
-        if insights: system += f"\nBehavioral insights:\n{insights}"
+        if episodes: system += f"\nBehavioral episodes:\n{episodes}"
 
         # 3. Get response
         history.append({"role": "user", "content": user_input})
@@ -241,7 +251,7 @@ v = Vektori(extraction_model="litellm:groq/llama3-8b-8192")
 |---|---|---|
 | Memory model | Entity-relation triples | Three-layer sentence graph |
 | What you get | The answer | The answer + reasoning + story |
-| Cross-session patterns | Manual graph queries | Auto-discovered (Insight layer) |
+| Patterns beyond facts | Manual graph queries | Auto-discovered (Episode layer) |
 | Default backend | Requires external DB | **SQLite, zero config** |
 | Fully local / offline | No | **Yes — Ollama, BGE-M3, SentenceTransformers** |
 | License | Partial OSS | **Full MIT** |
