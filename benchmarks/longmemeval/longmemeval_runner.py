@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -194,8 +195,22 @@ class LongMemEvalBenchmark:
 
             user_id = f"bq_{qid}"
             try:
+                q_t0 = time.perf_counter()
+
+                ingest_t0 = time.perf_counter()
                 await self._ingest_question(instance, user_id)
+                ingestion_ms = (time.perf_counter() - ingest_t0) * 1000
+
+                answer_t0 = time.perf_counter()
                 result = await self._answer_question(instance, user_id)
+                answer_pipeline_ms = (time.perf_counter() - answer_t0) * 1000
+
+                total_question_ms = (time.perf_counter() - q_t0) * 1000
+
+                result["ingestion_ms"] = round(ingestion_ms, 1)
+                result["answer_pipeline_ms"] = round(answer_pipeline_ms, 1)
+                result["total_question_ms"] = round(total_question_ms, 1)
+
                 self._checkpoint.mark_done(qid, result)
                 self._checkpoint.save()
 
@@ -339,15 +354,20 @@ class LongMemEvalBenchmark:
         question_type = instance["question_type"]
         question_date = instance.get("question_date") or ""
 
+        retrieval_t0 = time.perf_counter()
         search_results = await self.vektori_client.search(
             query=question,
             user_id=user_id,
             depth=self.config.retrieval_depth,
             reference_date=_parse_date(question_date) if question_date else None,
         )
+        retrieval_ms = (time.perf_counter() - retrieval_t0) * 1000
 
         context = self._format_retrieved_context(search_results)
+
+        qa_t0 = time.perf_counter()
         answer = await self._generate_answer(question, context, question_type, question_date)
+        qa_ms = (time.perf_counter() - qa_t0) * 1000
 
         return {
             "question_id": qid,
@@ -357,6 +377,8 @@ class LongMemEvalBenchmark:
             "expected_answer": instance["answer"],
             "retrieved_context": context,
             "retrieval_depth": self.config.retrieval_depth,
+            "retrieval_ms": round(retrieval_ms, 1),
+            "qa_ms": round(qa_ms, 1),
         }
 
     def _format_retrieved_context(self, search_results: Any) -> str:
@@ -517,6 +539,42 @@ class LongMemEvalBenchmark:
             if answered:
                 metrics["by_type"][qt]["answered"] += 1
 
+        def _collect(field: str) -> list[float]:
+            vals: list[float] = []
+            for r in qa_results:
+                v = r.get(field)
+                if isinstance(v, (int, float)):
+                    vals.append(float(v))
+            return vals
+
+        def _avg(vals: list[float]) -> float | None:
+            return round(sum(vals) / len(vals), 1) if vals else None
+
+        def _p95(vals: list[float]) -> float | None:
+            if not vals:
+                return None
+            s = sorted(vals)
+            # nearest-rank percentile: ceil(0.95 * N) - 1
+            idx = max(0, ((len(s) * 95 + 99) // 100) - 1)
+            idx = min(idx, len(s) - 1)
+            return round(s[idx], 1)
+
+        ingestion_vals = _collect("ingestion_ms")
+        retrieval_vals = _collect("retrieval_ms")
+        qa_vals = _collect("qa_ms")
+        total_vals = _collect("total_question_ms")
+
+        metrics["latency_ms"] = {
+            "ingestion_avg": _avg(ingestion_vals),
+            "ingestion_p95": _p95(ingestion_vals),
+            "retrieval_avg": _avg(retrieval_vals),
+            "retrieval_p95": _p95(retrieval_vals),
+            "qa_avg": _avg(qa_vals),
+            "qa_p95": _p95(qa_vals),
+            "total_question_avg": _avg(total_vals),
+            "total_question_p95": _p95(total_vals),
+        }
+
         return metrics
 
     # ── Save results ──────────────────────────────────────────────────────────
@@ -570,6 +628,29 @@ class LongMemEvalBenchmark:
             print(f"\nTotal : {metrics['total_questions']}")
             print(f"Answered : {metrics['answered']}")
             print(f"Abstained: {metrics['abstained']}")
+            lat = metrics.get("latency_ms") or {}
+            if lat:
+                print("\nLatency (ms):")
+                print(
+                    "  Ingestion      avg={0}  p95={1}".format(
+                        lat.get("ingestion_avg"), lat.get("ingestion_p95")
+                    )
+                )
+                print(
+                    "  Retrieval      avg={0}  p95={1}".format(
+                        lat.get("retrieval_avg"), lat.get("retrieval_p95")
+                    )
+                )
+                print(
+                    "  QA generation  avg={0}  p95={1}".format(
+                        lat.get("qa_avg"), lat.get("qa_p95")
+                    )
+                )
+                print(
+                    "  Total/question avg={0}  p95={1}".format(
+                        lat.get("total_question_avg"), lat.get("total_question_p95")
+                    )
+                )
             if metrics.get("by_type"):
                 print("\nBy question type:")
                 for qt, counts in metrics["by_type"].items():

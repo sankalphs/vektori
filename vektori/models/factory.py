@@ -14,6 +14,8 @@ EMBEDDING_REGISTRY: dict[str, str] = {
     "sentence-transformers": "vektori.models.sentence_transformers.SentenceTransformerEmbedder",
     # BGE-M3: fully local, multilingual, 1024-dim — recommended default
     "bge": "vektori.models.bge.BGEEmbedder",
+    # Cloudflare Workers AI: remote BGE-M3, zero local GPU, 1024-dim
+    "cloudflare": "vektori.models.cloudflare.CloudflareEmbedder",
 }
 
 LLM_REGISTRY: dict[str, str] = {
