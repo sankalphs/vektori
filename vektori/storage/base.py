@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Any
 
 
@@ -13,12 +14,20 @@ class StorageBackend(ABC):
     Backends: SQLite (zero-config default), PostgreSQL+pgvector (production),
               Memory (unit tests / CI).
 
-    The interface maps directly to the three-layer graph schema:
-      - Sentences (L2): raw conversation nodes + NEXT edges
+    The interface maps directly to the two-layer graph schema:
       - Facts (L0): LLM-extracted statements, primary vector search surface
-      - Insights (L1): inferred patterns, discovered via graph traversal
-      - Join tables: fact_sources, insight_facts, insight_sources
+      - Sentences (L2): raw conversation nodes + NEXT edges (context expansion)
+      - Join tables: fact_sources (L0↔L2)
+
+    Layer numbering matches SearchPipeline depth parameter:
+      L0 — vector search over facts only
+      L1 — facts + source sentences (no expansion)
+      L2 — L1 + full session context window (±N expansion)
     """
+
+    # Set to True in backends that implement search_l2_single_query.
+    # SearchPipeline checks this to decide whether to use the fast CTE path.
+    supports_single_query: bool = False
 
     # ── Sentences ──
 
@@ -53,6 +62,33 @@ class StorageBackend(ABC):
         """Find sentence IDs semantically similar to given quotes. Used to link facts/insights to source sentences."""
         ...
 
+    async def search_sentences_in_session(
+        self,
+        embedding: list[float],
+        session_id: str,
+        limit: int = 3,
+        threshold: float = 0.75,
+    ) -> list[str]:
+        """Vector search for sentences within a session. Returns sentence IDs above threshold.
+
+        Used by the extractor as a fallback when exact source-quote matching fails
+        (e.g. the LLM paraphrased the quote). Override in backends for efficiency.
+        """
+        return []
+
+    @abstractmethod
+    async def find_sentence_containing(
+        self,
+        session_id: str,
+        quote: str,
+    ) -> dict[str, Any] | None:
+        """
+        Find first sentence in session whose text contains quote as substring.
+        Case-insensitive. Returns sentence dict or None.
+        Used by extractor for source quote validation before falling back to similarity.
+        """
+        ...
+
     # ── Facts ──
 
     @abstractmethod
@@ -62,11 +98,18 @@ class StorageBackend(ABC):
         embedding: list[float],
         user_id: str,
         agent_id: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
         confidence: float = 1.0,
         superseded_by_target: str | None = None,
         metadata: dict[str, Any] | None = None,
+        event_time: datetime | None = None,
     ) -> str:
-        """Insert a fact and return its UUID."""
+        """Insert a fact and return its UUID.
+
+        event_time: when the source conversation happened (session started_at),
+        distinct from created_at (extraction time). Used for temporal filtering.
+        """
         ...
 
     @abstractmethod
@@ -75,10 +118,16 @@ class StorageBackend(ABC):
         embedding: list[float],
         user_id: str,
         agent_id: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
         limit: int = 10,
         active_only: bool = True,
+        before_date: datetime | None = None,
+        after_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Vector search over facts. Results include a 'distance' field (cosine distance)."""
+        """Vector search over facts. Results include a 'distance' field (cosine distance).
+        subject: pre-filter to facts about this entity before the vector scan.
+        before_date/after_date: filter by event_time for temporal queries."""
         ...
 
     @abstractmethod
@@ -87,6 +136,7 @@ class StorageBackend(ABC):
         user_id: str,
         agent_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         ...
 
@@ -100,6 +150,11 @@ class StorageBackend(ABC):
         ...
 
     @abstractmethod
+    async def increment_fact_mentions(self, fact_id: str) -> None:
+        """Increment the mentions counter on an existing fact (write-time semantic dedup)."""
+        ...
+
+    @abstractmethod
     async def find_fact_by_text(
         self,
         user_id: str,
@@ -110,39 +165,10 @@ class StorageBackend(ABC):
 
     @abstractmethod
     async def get_supersession_chain(self, fact_id: str) -> list[dict[str, Any]]:
-        """Return full chain: [oldest superseded fact, ..., current active fact]."""
-        ...
+        """Return full chain starting from fact_id, newest first.
 
-    # ── Insights ──
-
-    @abstractmethod
-    async def insert_insight(
-        self,
-        text: str,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        confidence: float = 1.0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        """Insert an insight and return its UUID."""
-        ...
-
-    @abstractmethod
-    async def get_insights_from_facts(
-        self,
-        fact_ids: list[str],
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Graph traversal: JOIN insight_facts WHERE fact_id IN (...). NOT vector search."""
-        ...
-
-    @abstractmethod
-    async def get_active_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+        [fact_id (depth=0), superseded_by (depth=1), ..., oldest ancestor]
+        """
         ...
 
     # ── Edges ──
@@ -168,19 +194,70 @@ class StorageBackend(ABC):
         """Link a fact to the sentence it was extracted from."""
         ...
 
+    async def insert_fact_sources(self, pairs: list[tuple[str, str]]) -> None:
+        """Batch link facts to source sentences. Override for efficiency."""
+        for fact_id, sentence_id in pairs:
+            await self.insert_fact_source(fact_id, sentence_id)
+
+    # ── Insights ──
+
     @abstractmethod
-    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
-        """Link an insight to a related fact. This is the key L1↔L0 bridge."""
+    async def insert_insight(
+        self,
+        text: str,
+        embedding: list[float],
+        user_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        """Insert an insight and return its UUID.
+
+        Uses a deterministic ID (uuid5 of user_id+text) so inserting the same
+        insight twice is idempotent — ON CONFLICT DO NOTHING.
+        embedding: pre-computed vector of the insight text for direct vector search.
+        """
         ...
 
     @abstractmethod
-    async def insert_insight_source(self, insight_id: str, sentence_id: str) -> None:
-        """Link an insight to a source sentence."""
+    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
+        """Link an insight to a fact it was derived from. ON CONFLICT DO NOTHING."""
+        ...
+
+    @abstractmethod
+    async def get_insights_for_facts(self, fact_ids: list[str]) -> list[dict[str, Any]]:
+        """Return insights linked to any of the given facts via insight_facts.
+
+        Used at retrieval time to surface L1 patterns after L0 vector search.
+        Returns insight dicts with at minimum {id, text}.
+        """
+        ...
+
+    @abstractmethod
+    async def search_insights(
+        self,
+        embedding: list[float],
+        user_id: str,
+        agent_id: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Vector search over insights for a user.
+
+        Complements graph traversal: surfaces insights from sessions whose facts
+        didn't land in the top-k but whose insight text is semantically close to
+        the query.
+        """
         ...
 
     @abstractmethod
     async def get_source_sentences(self, fact_ids: list[str]) -> list[str]:
         """Return sentence IDs that are sources for the given facts (via fact_sources)."""
+        ...
+
+    @abstractmethod
+    async def get_sentences_by_ids(
+        self, sentence_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Fetch full sentence rows for the given IDs."""
         ...
 
     # ── Sessions ──
@@ -192,7 +269,10 @@ class StorageBackend(ABC):
         user_id: str,
         agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        started_at: datetime | None = None,
     ) -> None:
+        """Upsert a session record. started_at overrides the DB default when provided
+        (used by LongMemEval and other benchmarks that supply historical timestamps)."""
         ...
 
     @abstractmethod
@@ -201,6 +281,15 @@ class StorageBackend(ABC):
         session_id: str,
         user_id: str,
     ) -> dict[str, Any] | None:
+        ...
+
+    @abstractmethod
+    async def count_sessions(
+        self,
+        user_id: str,
+        agent_id: str | None = None,
+    ) -> int:
+        """Count distinct sessions for a user."""
         ...
 
     # ── Lifecycle ──

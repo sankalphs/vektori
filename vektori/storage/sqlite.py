@@ -59,6 +59,7 @@ class SQLiteBackend(StorageBackend):
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._create_tables()
+        await self._migrate()
         await self._conn.commit()
         logger.info("SQLite backend initialized at %s", self.db_path)
 
@@ -87,22 +88,13 @@ class SQLiteBackend(StorageBackend):
                 embedding TEXT,
                 user_id TEXT NOT NULL,
                 agent_id TEXT,
+                session_id TEXT,
+                subject TEXT,
                 is_active INTEGER DEFAULT 1,
                 superseded_by TEXT REFERENCES facts(id),
                 confidence REAL DEFAULT 1.0,
                 metadata TEXT DEFAULT '{}',
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS insights (
-                id TEXT PRIMARY KEY,
-                text TEXT NOT NULL,
-                embedding TEXT,
-                user_id TEXT NOT NULL,
-                agent_id TEXT,
-                confidence REAL DEFAULT 1.0,
-                is_active INTEGER DEFAULT 1,
-                metadata TEXT DEFAULT '{}',
+                event_time TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
@@ -121,18 +113,6 @@ class SQLiteBackend(StorageBackend):
                 PRIMARY KEY (fact_id, sentence_id)
             );
 
-            CREATE TABLE IF NOT EXISTS insight_sources (
-                insight_id TEXT NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-                sentence_id TEXT NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
-                PRIMARY KEY (insight_id, sentence_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS insight_facts (
-                insight_id TEXT NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-                fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
-                PRIMARY KEY (insight_id, fact_id)
-            );
-
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
@@ -144,12 +124,42 @@ class SQLiteBackend(StorageBackend):
 
             CREATE INDEX IF NOT EXISTS idx_sentences_user ON sentences (user_id);
             CREATE INDEX IF NOT EXISTS idx_sentences_session ON sentences (session_id);
+            CREATE TABLE IF NOT EXISTS insights (
+                id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                embedding TEXT,            -- JSON array of floats
+                user_id TEXT NOT NULL,
+                agent_id TEXT,
+                session_id TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE (user_id, text)
+            );
+
+            CREATE TABLE IF NOT EXISTS insight_facts (
+                insight_id TEXT NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
+                fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+                PRIMARY KEY (insight_id, fact_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_facts_user ON facts (user_id);
             CREATE INDEX IF NOT EXISTS idx_facts_active ON facts (user_id, is_active);
-            CREATE INDEX IF NOT EXISTS idx_insights_user ON insights (user_id);
-            CREATE INDEX IF NOT EXISTS idx_insight_facts_fact ON insight_facts (fact_id);
             CREATE INDEX IF NOT EXISTS idx_fact_sources_fact ON fact_sources (fact_id);
+            CREATE INDEX IF NOT EXISTS idx_insight_facts_fact ON insight_facts (fact_id);
         """)
+
+    async def _migrate(self) -> None:
+        """Apply additive migrations for existing DBs. Safe to run on every init."""
+        async with self._conn.execute("PRAGMA table_info(facts)") as cursor:
+            cols = {row[1] for row in await cursor.fetchall()}
+        if "session_id" not in cols:
+            await self._conn.execute("ALTER TABLE facts ADD COLUMN session_id TEXT")
+        if "subject" not in cols:
+            await self._conn.execute("ALTER TABLE facts ADD COLUMN subject TEXT")
+        if "mentions" not in cols:
+            await self._conn.execute("ALTER TABLE facts ADD COLUMN mentions INTEGER DEFAULT 1")
+        if "event_time" not in cols:
+            await self._conn.execute("ALTER TABLE facts ADD COLUMN event_time TEXT")
 
     async def close(self) -> None:
         if self._conn:
@@ -217,8 +227,42 @@ class SQLiteBackend(StorageBackend):
         session_id: str,
         threshold: float = 0.75,
     ) -> list[str]:
-        # TODO: embed each quote (requires access to embedder — wire in later)
+        # Superseded by search_sentences_in_session (embedding-based).
         return []
+
+    async def search_sentences_in_session(
+        self,
+        embedding: list[float],
+        session_id: str,
+        limit: int = 3,
+        threshold: float = 0.75,
+    ) -> list[str]:
+        """Cosine vector search over sentences in a session. Used for fact-source linking."""
+        async with self._conn.execute(
+            "SELECT id, embedding FROM sentences WHERE session_id = ? AND is_active = 1",
+            (session_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        scored: list[tuple[float, str]] = []
+        for row in rows:
+            emb = json.loads(row["embedding"])
+            sim = _cosine_similarity(embedding, emb)
+            if sim >= threshold:
+                scored.append((sim, row["id"]))
+        scored.sort(key=lambda x: -x[0])
+        return [r[1] for r in scored[:limit]]
+
+    async def find_sentence_containing(
+        self,
+        session_id: str,
+        quote: str,
+    ) -> dict[str, Any] | None:
+        async with self._conn.execute(
+            "SELECT * FROM sentences WHERE session_id = ? AND text LIKE ? LIMIT 1",
+            (session_id, f"%{quote}%"),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
 
     # ── Facts ──
 
@@ -228,16 +272,23 @@ class SQLiteBackend(StorageBackend):
         embedding: list[float],
         user_id: str,
         agent_id: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
         confidence: float = 1.0,
         superseded_by_target: str | None = None,
         metadata: dict[str, Any] | None = None,
+        event_time: datetime | None = None,
     ) -> str:
         fact_id = str(uuid.uuid4())
+        event_time_str = event_time.isoformat() if event_time else None
         await self._conn.execute(
-            """INSERT INTO facts (id, text, embedding, user_id, agent_id, confidence, superseded_by, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (fact_id, text, json.dumps(embedding), user_id, agent_id,
-             confidence, superseded_by_target, json.dumps(metadata or {})),
+            """INSERT INTO facts
+               (id, text, embedding, user_id, agent_id, session_id, subject,
+                confidence, superseded_by, metadata, event_time)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (fact_id, text, json.dumps(embedding), user_id, agent_id, session_id,
+             subject, confidence, superseded_by_target, json.dumps(metadata or {}),
+             event_time_str),
         )
         await self._conn.commit()
         return fact_id
@@ -247,8 +298,12 @@ class SQLiteBackend(StorageBackend):
         embedding: list[float],
         user_id: str,
         agent_id: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
         limit: int = 10,
         active_only: bool = True,
+        before_date: datetime | None = None,
+        after_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM facts WHERE user_id = ?"
         params: list[Any] = [user_id]
@@ -257,6 +312,18 @@ class SQLiteBackend(StorageBackend):
         if agent_id:
             query += " AND agent_id = ?"
             params.append(agent_id)
+        if session_id:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        if subject:
+            query += " AND subject = ?"
+            params.append(subject)
+        if before_date:
+            query += " AND event_time <= ?"
+            params.append(before_date.isoformat())
+        if after_date:
+            query += " AND event_time >= ?"
+            params.append(after_date.isoformat())
         async with self._conn.execute(query, params) as cursor:
             rows = await cursor.fetchall()
         results = []
@@ -274,10 +341,10 @@ class SQLiteBackend(StorageBackend):
         user_id: str,
         agent_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        query = "SELECT * FROM facts WHERE user_id = ? AND is_active = 1 LIMIT ?"
-        params: list[Any] = [user_id, limit]
-        async with self._conn.execute(query, params) as cursor:
+        query = "SELECT * FROM facts WHERE user_id = ? AND is_active = 1 LIMIT ? OFFSET ?"
+        async with self._conn.execute(query, (user_id, limit, offset)) as cursor:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
@@ -285,6 +352,13 @@ class SQLiteBackend(StorageBackend):
         await self._conn.execute(
             "UPDATE facts SET is_active = 0, superseded_by = ? WHERE id = ?",
             (superseded_by, fact_id),
+        )
+        await self._conn.commit()
+
+    async def increment_fact_mentions(self, fact_id: str) -> None:
+        await self._conn.execute(
+            "UPDATE facts SET mentions = mentions + 1 WHERE id = ?",
+            (fact_id,),
         )
         await self._conn.commit()
 
@@ -318,58 +392,6 @@ class SQLiteBackend(StorageBackend):
             else:
                 break
         return chain
-
-    # ── Insights ──
-
-    async def insert_insight(
-        self,
-        text: str,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        confidence: float = 1.0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        insight_id = str(uuid.uuid4())
-        await self._conn.execute(
-            """INSERT INTO insights (id, text, embedding, user_id, agent_id, confidence, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (insight_id, text, json.dumps(embedding), user_id, agent_id,
-             confidence, json.dumps(metadata or {})),
-        )
-        await self._conn.commit()
-        return insight_id
-
-    async def get_insights_from_facts(
-        self,
-        fact_ids: list[str],
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        if not fact_ids:
-            return []
-        placeholders = ",".join("?" * len(fact_ids))
-        query = f"""
-            SELECT DISTINCT i.* FROM insights i
-            JOIN insight_facts inf ON i.id = inf.insight_id
-            WHERE inf.fact_id IN ({placeholders})
-        """
-        if active_only:
-            query += " AND i.is_active = 1"
-        async with self._conn.execute(query, fact_ids) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def get_active_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        async with self._conn.execute(
-            "SELECT * FROM insights WHERE user_id = ? AND is_active = 1",
-            (user_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
 
     # ── Edges ──
 
@@ -413,20 +435,6 @@ class SQLiteBackend(StorageBackend):
         )
         await self._conn.commit()
 
-    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
-        await self._conn.execute(
-            "INSERT OR IGNORE INTO insight_facts (insight_id, fact_id) VALUES (?, ?)",
-            (insight_id, fact_id),
-        )
-        await self._conn.commit()
-
-    async def insert_insight_source(self, insight_id: str, sentence_id: str) -> None:
-        await self._conn.execute(
-            "INSERT OR IGNORE INTO insight_sources (insight_id, sentence_id) VALUES (?, ?)",
-            (insight_id, sentence_id),
-        )
-        await self._conn.commit()
-
     async def get_source_sentences(self, fact_ids: list[str]) -> list[str]:
         if not fact_ids:
             return []
@@ -438,6 +446,89 @@ class SQLiteBackend(StorageBackend):
             rows = await cursor.fetchall()
         return [row[0] for row in rows]
 
+    # ── Insights ──
+
+    async def insert_insight(
+        self,
+        text: str,
+        embedding: list[float],
+        user_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        insight_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{user_id}::{text}"))
+        await self._conn.execute(
+            """INSERT OR IGNORE INTO insights (id, text, embedding, user_id, agent_id, session_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (insight_id, text, json.dumps(embedding), user_id, agent_id, session_id),
+        )
+        await self._conn.commit()
+        return insight_id
+
+    async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO insight_facts (insight_id, fact_id) VALUES (?, ?)",
+            (insight_id, fact_id),
+        )
+        await self._conn.commit()
+
+    async def get_insights_for_facts(self, fact_ids: list[str]) -> list[dict[str, Any]]:
+        if not fact_ids:
+            return []
+        placeholders = ",".join("?" * len(fact_ids))
+        async with self._conn.execute(
+            f"""SELECT DISTINCT i.id, i.text, i.session_id, i.created_at
+                FROM insights i
+                JOIN insight_facts if2 ON i.id = if2.insight_id
+                WHERE if2.fact_id IN ({placeholders}) AND i.is_active = 1""",
+            fact_ids,
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def search_insights(
+        self,
+        embedding: list[float],
+        user_id: str,
+        agent_id: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT id, text, session_id, embedding, created_at FROM insights WHERE user_id = ? AND is_active = 1"
+        params: list[Any] = [user_id]
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        async with self._conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+        results = []
+        for row in rows:
+            row_dict = dict(row)
+            emb = json.loads(row_dict.pop("embedding") or "null")
+            if emb:
+                sim = _cosine_similarity(embedding, emb)
+                results.append({**row_dict, "distance": 1.0 - sim})
+        results.sort(key=lambda x: x["distance"])
+        return results[:limit]
+
+    async def get_sentences_by_ids(
+        self, sentence_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        if not sentence_ids:
+            return []
+        placeholders = ",".join("?" * len(sentence_ids))
+        async with self._conn.execute(
+            f"""
+            SELECT id, text, session_id, turn_number, sentence_index, role, created_at
+            FROM sentences
+            WHERE id IN ({placeholders}) AND is_active = 1
+            ORDER BY session_id, turn_number, sentence_index
+            """,
+            sentence_ids,
+        ) as cursor:
+            rows = await cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+
     # ── Sessions ──
 
     async def upsert_session(
@@ -446,12 +537,14 @@ class SQLiteBackend(StorageBackend):
         user_id: str,
         agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        started_at: datetime | None = None,
     ) -> None:
+        started_at_str = started_at.isoformat() if started_at else None
         await self._conn.execute(
-            """INSERT INTO sessions (id, user_id, agent_id, metadata)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO sessions (id, user_id, agent_id, metadata, started_at)
+               VALUES (?, ?, ?, ?, COALESCE(?, datetime('now')))
                ON CONFLICT (id) DO UPDATE SET metadata = excluded.metadata""",
-            (session_id, user_id, agent_id, json.dumps(metadata or {})),
+            (session_id, user_id, agent_id, json.dumps(metadata or {}), started_at_str),
         )
         await self._conn.commit()
 
@@ -475,6 +568,20 @@ class SQLiteBackend(StorageBackend):
             sents = await cursor.fetchall()
         session["sentences"] = [dict(s) for s in sents]
         return session
+
+    async def count_sessions(
+        self,
+        user_id: str,
+        agent_id: str | None = None,
+    ) -> int:
+        query = "SELECT COUNT(*) FROM sessions WHERE user_id = ?"
+        params: list[Any] = [user_id]
+        if agent_id is not None:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        async with self._conn.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else 0
 
     # ── Lifecycle ──
 

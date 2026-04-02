@@ -14,12 +14,15 @@ EMBEDDING_REGISTRY: dict[str, str] = {
     "sentence-transformers": "vektori.models.sentence_transformers.SentenceTransformerEmbedder",
     # BGE-M3: fully local, multilingual, 1024-dim — recommended default
     "bge": "vektori.models.bge.BGEEmbedder",
+    # Cloudflare Workers AI: remote BGE-M3, zero local GPU, 1024-dim
+    "cloudflare": "vektori.models.cloudflare.CloudflareEmbedder",
 }
 
 LLM_REGISTRY: dict[str, str] = {
     "openai": "vektori.models.openai.OpenAILLM",
     "anthropic": "vektori.models.anthropic.AnthropicLLM",
     "ollama": "vektori.models.ollama.OllamaLLM",
+    "gemini": "vektori.models.gemini.GeminiLLM",  # Direct Gemini API
     # LiteLLM: single interface for 100+ providers — recommended for extraction
     "litellm": "vektori.models.litellm_provider.LiteLLMProvider",
 }

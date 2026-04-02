@@ -37,15 +37,6 @@ async def populated_pipeline():
     )
     await db.insert_fact_source(fact_id, "sent-1")
 
-    # Insight linked to fact
-    insight_id = await db.insert_insight(
-        text="Offering email after WhatsApp preference correlates with disconnection",
-        embedding=[0.9] + [0.0] * 1535,
-        user_id="u1",
-        confidence=0.80,
-    )
-    await db.insert_insight_fact(insight_id, fact_id)
-
     pipeline = SearchPipeline(db=db, embedder=embedder)
     return pipeline
 
@@ -53,7 +44,7 @@ async def populated_pipeline():
 async def test_l0_depth(populated_pipeline):
     results = await populated_pipeline.search("WhatsApp preference", "u1", depth="l0")
     assert "facts" in results
-    assert "insights" not in results
+    assert "insights" in results
     assert "sentences" not in results
 
 
@@ -61,16 +52,12 @@ async def test_l1_depth(populated_pipeline):
     results = await populated_pipeline.search("WhatsApp preference", "u1", depth="l1")
     assert "facts" in results
     assert "insights" in results
-    assert "sentences" not in results
-    # Should discover the linked insight
-    assert len(results["insights"]) == 1
-    assert "WhatsApp" in results["insights"][0]["text"]
+    assert "sentences" in results  # L1 returns source sentences (exact origin of each fact)
 
 
 async def test_l2_depth(populated_pipeline):
     results = await populated_pipeline.search("WhatsApp preference", "u1", depth="l2")
     assert "facts" in results
-    assert "insights" in results
     assert "sentences" in results
     # Should trace back to source sentence
     assert len(results["sentences"]) >= 1

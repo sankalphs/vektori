@@ -4,6 +4,7 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- for find_sentences_by_similarity
 
 -- ============================================================
 -- SENTENCES: The bottom layer (L2). Raw conversation, sequential flow.
@@ -54,46 +55,30 @@ CREATE TABLE IF NOT EXISTS facts (
 
     user_id TEXT NOT NULL,
     agent_id TEXT,
+    session_id TEXT,                           -- which session produced this fact
+    subject TEXT,                              -- entity this fact is about (pre-filter discriminator)
 
     is_active BOOLEAN DEFAULT true,
     superseded_by UUID REFERENCES facts(id),  -- conflict resolution chain
     confidence FLOAT DEFAULT 1.0,
+    mentions INTEGER DEFAULT 1,               -- incremented on cross-session semantic dedup
+
+    -- Temporal anchor: when the conversation happened (session started_at),
+    -- not when extraction ran. Used for time-aware retrieval filtering.
+    event_time TIMESTAMPTZ,
 
     metadata JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE INDEX IF NOT EXISTS idx_facts_event_time ON facts (user_id, event_time) WHERE event_time IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_facts_embedding ON facts
     USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS idx_facts_user ON facts (user_id);
 CREATE INDEX IF NOT EXISTS idx_facts_user_agent ON facts (user_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_facts_active ON facts (user_id, is_active) WHERE is_active = true;
-
-
--- ============================================================
--- INSIGHTS: The middle layer (L1). LLM-inferred cross-session patterns.
--- NOT a vector search target. Discovered via graph traversal from facts.
--- ============================================================
-CREATE TABLE IF NOT EXISTS insights (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    text TEXT NOT NULL,
-    embedding vector(1536),    -- stored but NOT indexed — not searched directly
-
-    user_id TEXT NOT NULL,
-    agent_id TEXT,
-
-    confidence FLOAT DEFAULT 1.0,
-    is_active BOOLEAN DEFAULT true,
-
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
-);
-
--- NOTE: No vector index on insights — they're discovered via graph, not search.
-CREATE INDEX IF NOT EXISTS idx_insights_user ON insights (user_id);
-CREATE INDEX IF NOT EXISTS idx_insights_user_agent ON insights (user_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts (user_id, subject) WHERE subject IS NOT NULL;
 
 
 -- ============================================================
@@ -130,35 +115,6 @@ CREATE INDEX IF NOT EXISTS idx_fact_sources_sentence ON fact_sources (sentence_i
 
 
 -- ============================================================
--- INSIGHT_SOURCES: Links insights (L1) to source sentences (L2).
--- ============================================================
-CREATE TABLE IF NOT EXISTS insight_sources (
-    insight_id UUID NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-    sentence_id UUID NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
-    PRIMARY KEY (insight_id, sentence_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_insight_sources_insight ON insight_sources (insight_id);
-CREATE INDEX IF NOT EXISTS idx_insight_sources_sentence ON insight_sources (sentence_id);
-
-
--- ============================================================
--- INSIGHT_FACTS: Links insights (L1) to related facts (L0).
--- THE KEY BRIDGE.
--- Vector search finds facts → JOIN here → discovers insights.
--- This is how the insight layer is found without vector search.
--- ============================================================
-CREATE TABLE IF NOT EXISTS insight_facts (
-    insight_id UUID NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
-    fact_id UUID NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
-    PRIMARY KEY (insight_id, fact_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_insight_facts_insight ON insight_facts (insight_id);
-CREATE INDEX IF NOT EXISTS idx_insight_facts_fact ON insight_facts (fact_id);
-
-
--- ============================================================
 -- SESSIONS: Metadata about conversation sessions.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS sessions (
@@ -171,3 +127,39 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
+
+
+-- ============================================================
+-- INSIGHTS: The middle layer (L1). LLM-inferred cross-session patterns.
+-- Not vector-searched — discovered via graph traversal from matched facts.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS insights (
+    id UUID PRIMARY KEY,
+    text TEXT NOT NULL,
+    embedding vector(1536),               -- for direct vector search at retrieval
+    user_id TEXT NOT NULL,
+    agent_id TEXT,
+    session_id TEXT,                       -- session this insight came from
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_insights_user ON insights (user_id);
+CREATE INDEX IF NOT EXISTS idx_insights_embedding ON insights
+    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- Dedup: same insight text for same user is idempotent
+CREATE UNIQUE INDEX IF NOT EXISTS idx_insights_user_text ON insights (user_id, text);
+
+
+-- ============================================================
+-- INSIGHT_FACTS: Links insights (L1) to the facts (L0) they were derived from.
+-- Graph edge: traversed after L0 vector search to surface patterns.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS insight_facts (
+    insight_id UUID NOT NULL REFERENCES insights(id) ON DELETE CASCADE,
+    fact_id UUID NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+    PRIMARY KEY (insight_id, fact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_insight_facts_insight ON insight_facts (insight_id);
+CREATE INDEX IF NOT EXISTS idx_insight_facts_fact ON insight_facts (fact_id);

@@ -29,12 +29,11 @@ class MemoryBackend(StorageBackend):
     def __init__(self) -> None:
         self._sentences: dict[str, dict[str, Any]] = {}
         self._facts: dict[str, dict[str, Any]] = {}
-        self._insights: dict[str, dict[str, Any]] = {}
         self._edges: list[dict[str, Any]] = []
         self._fact_sources: list[dict[str, str]] = []       # [{fact_id, sentence_id}]
-        self._insight_facts: list[dict[str, str]] = []      # [{insight_id, fact_id}]
-        self._insight_sources: list[dict[str, str]] = []    # [{insight_id, sentence_id}]
         self._sessions: dict[str, dict[str, Any]] = {}
+        self._insights: dict[str, dict[str, Any]] = {}
+        self._insight_facts: list[dict[str, str]] = []      # [{insight_id, fact_id}]
 
     async def initialize(self) -> None:
         pass  # Nothing to do
@@ -95,9 +94,39 @@ class MemoryBackend(StorageBackend):
         session_id: str,
         threshold: float = 0.75,
     ) -> list[str]:
-        # TODO: embed quotes and do cosine search within session
-        # For now returns empty — fact-source linking will be incomplete in memory backend
+        # Superseded by search_sentences_in_session (embedding-based).
         return []
+
+    async def search_sentences_in_session(
+        self,
+        embedding: list[float],
+        session_id: str,
+        limit: int = 3,
+        threshold: float = 0.75,
+    ) -> list[str]:
+        """In-memory cosine search over sentences in a session. Used for fact-source linking."""
+        scored: list[tuple[float, str]] = []
+        for s in self._sentences.values():
+            if s.get("session_id") != session_id:
+                continue
+            if s.get("embedding") is None:
+                continue
+            sim = _cosine_similarity(embedding, s["embedding"])
+            if sim >= threshold:
+                scored.append((sim, s["id"]))
+        scored.sort(key=lambda x: -x[0])
+        return [r[1] for r in scored[:limit]]
+
+    async def find_sentence_containing(
+        self,
+        session_id: str,
+        quote: str,
+    ) -> dict[str, Any] | None:
+        q = quote.lower()
+        for s in self._sentences.values():
+            if s.get("session_id") == session_id and q in s["text"].lower():
+                return s
+        return None
 
     # ── Facts ──
 
@@ -107,9 +136,12 @@ class MemoryBackend(StorageBackend):
         embedding: list[float],
         user_id: str,
         agent_id: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
         confidence: float = 1.0,
         superseded_by_target: str | None = None,
         metadata: dict[str, Any] | None = None,
+        event_time: datetime | None = None,
     ) -> str:
         fact_id = str(uuid.uuid4())
         self._facts[fact_id] = {
@@ -118,10 +150,14 @@ class MemoryBackend(StorageBackend):
             "embedding": embedding,
             "user_id": user_id,
             "agent_id": agent_id,
+            "session_id": session_id,
+            "subject": subject,
             "confidence": confidence,
+            "mentions": 1,
             "superseded_by": superseded_by_target,
             "is_active": True,
             "metadata": metadata or {},
+            "event_time": event_time,
             "created_at": datetime.utcnow(),
         }
         return fact_id
@@ -131,8 +167,12 @@ class MemoryBackend(StorageBackend):
         embedding: list[float],
         user_id: str,
         agent_id: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
         limit: int = 10,
         active_only: bool = True,
+        before_date: datetime | None = None,
+        after_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
         results = []
         for f in self._facts.values():
@@ -140,9 +180,18 @@ class MemoryBackend(StorageBackend):
                 continue
             if agent_id and f.get("agent_id") != agent_id:
                 continue
+            if session_id and f.get("session_id") != session_id:
+                continue
+            if subject and f.get("subject") != subject:
+                continue
             if active_only and not f.get("is_active", True):
                 continue
             if f.get("embedding") is None:
+                continue
+            et = f.get("event_time")
+            if before_date and et and et > before_date:
+                continue
+            if after_date and et and et < after_date:
                 continue
             sim = _cosine_similarity(embedding, f["embedding"])
             results.append({**f, "distance": 1.0 - sim})
@@ -154,11 +203,17 @@ class MemoryBackend(StorageBackend):
         user_id: str,
         agent_id: str | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        return [
+        results = [
             f for f in self._facts.values()
             if f.get("user_id") == user_id and f.get("is_active", True)
-        ][:limit]
+        ]
+        return results[offset: offset + limit]
+
+    async def increment_fact_mentions(self, fact_id: str) -> None:
+        if fact_id in self._facts:
+            self._facts[fact_id]["mentions"] = self._facts[fact_id].get("mentions", 1) + 1
 
     async def deactivate_fact(self, fact_id: str, superseded_by: str | None = None) -> None:
         if fact_id in self._facts:
@@ -190,59 +245,6 @@ class MemoryBackend(StorageBackend):
             else:
                 break
         return chain
-
-    # ── Insights ──
-
-    async def insert_insight(
-        self,
-        text: str,
-        embedding: list[float],
-        user_id: str,
-        agent_id: str | None = None,
-        confidence: float = 1.0,
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        insight_id = str(uuid.uuid4())
-        self._insights[insight_id] = {
-            "id": insight_id,
-            "text": text,
-            "embedding": embedding,
-            "user_id": user_id,
-            "agent_id": agent_id,
-            "confidence": confidence,
-            "is_active": True,
-            "metadata": metadata or {},
-            "created_at": datetime.utcnow(),
-        }
-        return insight_id
-
-    async def get_insights_from_facts(
-        self,
-        fact_ids: list[str],
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        fact_id_set = set(fact_ids)
-        insight_ids = {
-            link["insight_id"]
-            for link in self._insight_facts
-            if link["fact_id"] in fact_id_set
-        }
-        results = []
-        for iid in insight_ids:
-            insight = self._insights.get(iid)
-            if insight and (not active_only or insight.get("is_active", True)):
-                results.append(insight)
-        return results
-
-    async def get_active_insights(
-        self,
-        user_id: str,
-        agent_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        return [
-            i for i in self._insights.values()
-            if i.get("user_id") == user_id and i.get("is_active", True)
-        ]
 
     # ── Edges ──
 
@@ -277,14 +279,78 @@ class MemoryBackend(StorageBackend):
 
     # ── Join tables ──
 
-    async def insert_fact_source(self, fact_id: str, sentence_id: str) -> None:
-        self._fact_sources.append({"fact_id": fact_id, "sentence_id": sentence_id})
+    # ── Insights ──
+
+    async def insert_insight(
+        self,
+        text: str,
+        embedding: list[float],
+        user_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        insight_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{user_id}::{text}"))
+        if insight_id not in self._insights:
+            self._insights[insight_id] = {
+                "id": insight_id,
+                "text": text,
+                "embedding": embedding,
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "is_active": True,
+                "created_at": datetime.utcnow(),
+            }
+        return insight_id
 
     async def insert_insight_fact(self, insight_id: str, fact_id: str) -> None:
+        # Dedup: don't add the same link twice
+        for link in self._insight_facts:
+            if link["insight_id"] == insight_id and link["fact_id"] == fact_id:
+                return
         self._insight_facts.append({"insight_id": insight_id, "fact_id": fact_id})
 
-    async def insert_insight_source(self, insight_id: str, sentence_id: str) -> None:
-        self._insight_sources.append({"insight_id": insight_id, "sentence_id": sentence_id})
+    async def get_insights_for_facts(self, fact_ids: list[str]) -> list[dict[str, Any]]:
+        if not fact_ids:
+            return []
+        fact_id_set = set(fact_ids)
+        matched_insight_ids = {
+            link["insight_id"]
+            for link in self._insight_facts
+            if link["fact_id"] in fact_id_set
+        }
+        return [
+            {k: v for k, v in self._insights[iid].items() if k != "embedding"}
+            for iid in matched_insight_ids
+            if iid in self._insights and self._insights[iid].get("is_active", True)
+        ]
+
+    async def search_insights(
+        self,
+        embedding: list[float],
+        user_id: str,
+        agent_id: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        results = []
+        for ins in self._insights.values():
+            if ins.get("user_id") != user_id:
+                continue
+            if agent_id and ins.get("agent_id") != agent_id:
+                continue
+            if not ins.get("is_active", True):
+                continue
+            emb = ins.get("embedding")
+            if not emb:
+                continue
+            sim = _cosine_similarity(embedding, emb)
+            row = {k: v for k, v in ins.items() if k != "embedding"}
+            results.append({**row, "distance": 1.0 - sim})
+        results.sort(key=lambda x: x["distance"])
+        return results[:limit]
+
+    async def insert_fact_source(self, fact_id: str, sentence_id: str) -> None:
+        self._fact_sources.append({"fact_id": fact_id, "sentence_id": sentence_id})
 
     async def get_source_sentences(self, fact_ids: list[str]) -> list[str]:
         fact_id_set = set(fact_ids)
@@ -294,6 +360,19 @@ class MemoryBackend(StorageBackend):
             if link["fact_id"] in fact_id_set
         })
 
+    async def get_sentences_by_ids(
+        self, sentence_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        id_set = set(sentence_ids)
+        results = [
+            s for s in self._sentences.values()
+            if s["id"] in id_set and s.get("is_active", True)
+        ]
+        return sorted(
+            results,
+            key=lambda x: (x.get("session_id", ""), x.get("turn_number", 0), x.get("sentence_index", 0)),
+        )
+
     # ── Sessions ──
 
     async def upsert_session(
@@ -302,13 +381,14 @@ class MemoryBackend(StorageBackend):
         user_id: str,
         agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        started_at: datetime | None = None,
     ) -> None:
         self._sessions[session_id] = {
             "id": session_id,
             "user_id": user_id,
             "agent_id": agent_id,
             "metadata": metadata or {},
-            "started_at": datetime.utcnow(),
+            "started_at": started_at or datetime.utcnow(),
         }
 
     async def get_session(
@@ -324,6 +404,20 @@ class MemoryBackend(StorageBackend):
             key=lambda x: (x.get("turn_number", 0), x.get("sentence_index", 0)),
         )
         return {**session, "sentences": sentences}
+
+    async def count_sessions(
+        self,
+        user_id: str,
+        agent_id: str | None = None,
+    ) -> int:
+        count = 0
+        for s in self._sessions.values():
+            if s.get("user_id") != user_id:
+                continue
+            if agent_id is not None and s.get("agent_id") != agent_id:
+                continue
+            count += 1
+        return count
 
     # ── Lifecycle ──
 
