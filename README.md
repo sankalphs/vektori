@@ -2,7 +2,7 @@
 
 > **Memory that remembers the story, not just the facts.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/vektori)](https://pypi.org/project/vektori/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](YOUR_DISCORD_LINK)
@@ -275,8 +275,4 @@ pytest tests/unit/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
----
-
-<p align="center">Built by <a href="https://github.com/vektori-ai">Laxman & Manit</a> · Star ⭐ if Vektori helps you ship smarter agents</p>
+Apache 2.0 — see [LICENSE](LICENSE).
