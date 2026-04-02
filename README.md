@@ -1,15 +1,24 @@
-# Vektori
+<p align="center">
+  <img src="assets/logo/memory-stack-logo-transparent.svg" width="96" height="96" alt="Vektori logo" />
+</p>
 
-> **Memory that remembers the story, not just the facts.**
+<h1 align="center">Vektori</h1>
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/vektori)](https://pypi.org/project/vektori/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](YOUR_DISCORD_LINK)
+<p align="center"><strong>Memory that remembers the story, not just the facts.</strong></p>
 
-<!-- DEMO PLACEHOLDER — replace with a GIF or video showing add → search → facts + episodes output -->
-<!-- ![Vektori Demo](assets/demo.gif) -->
-> 📹 **Demo coming soon** — add → search → facts + episodes, in under 5 seconds.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0" /></a>
+  <a href="https://pypi.org/project/vektori/"><img src="https://img.shields.io/pypi/v/vektori" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/vektori/"><img src="https://img.shields.io/pypi/dm/vektori?color=blue" alt="PyPI Downloads" /></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+" /></a>
+  <a href="YOUR_DISCORD_LINK"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+</p>
+
+<p align="center">
+  <!-- DEMO PLACEHOLDER — swap this line with your GIF once ready -->
+  <!-- <img src="assets/demo.gif" width="700" alt="Vektori demo" /> -->
+  📹 <em>Demo coming soon — add → search → facts + episodes, in under 5 seconds.</em>
+</p>
 
 ---
 

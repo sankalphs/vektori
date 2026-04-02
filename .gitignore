@@ -63,3 +63,9 @@ data/*.json
 data/longmemeval_s_cleaned.json
 ISSUES.md
 .tmp_checkpoint_analysis*.py
+
+# Generated logo PNGs (regenerate with scripts/generate_logo_assets.py)
+assets/logo/favicon/
+assets/logo/app-icons/
+assets/logo/social/
+assets/logo/misc/
