@@ -31,6 +31,7 @@ _EMBEDDING_HELP = (
 # Persistent config helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_config() -> dict:
     if _CONFIG_PATH.exists():
         try:
@@ -78,12 +79,14 @@ def _warn_openai(model: str, var: str) -> None:
 def _silence_litellm() -> None:
     """Suppress LiteLLM's verbose stdout/stderr output."""
     import logging
+
     logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
     logging.getLogger("litellm").setLevel(logging.CRITICAL)
     # Suppress asyncio SSL transport errors on event loop close (cosmetic noise)
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
     try:
         import litellm
+
         litellm.suppress_debug_info = True
         litellm.set_verbose = False
     except Exception:
@@ -112,6 +115,7 @@ def _out(data: object, as_json: bool) -> None:
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
+
 
 @app.command()
 def config(
@@ -159,6 +163,7 @@ def config(
 # init
 # ---------------------------------------------------------------------------
 
+
 @app.command()
 def init(
     extraction_model: str | None = typer.Option(
@@ -187,6 +192,7 @@ def init(
 # add
 # ---------------------------------------------------------------------------
 
+
 @app.command()
 def add(
     text: str = typer.Argument(..., help="Text to store as a memory."),
@@ -201,7 +207,8 @@ def add(
         None, "--embedding-model", "-e", envvar="VEKTORI_EMBEDDING_MODEL", help=_EMBEDDING_HELP
     ),
     no_extraction: bool = typer.Option(
-        False, "--no-extraction",
+        False,
+        "--no-extraction",
         help="Skip LLM fact extraction. Stores sentence only — useful for testing without an API key.",
     ),
     as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
@@ -240,6 +247,7 @@ def add(
 # ---------------------------------------------------------------------------
 # search
 # ---------------------------------------------------------------------------
+
 
 @app.command()
 def search(
@@ -290,7 +298,9 @@ def search(
             score_str = f"  [{score:.3f}]" if score is not None else ""
             typer.echo(f"{i}.{score_str} {fact['text']}")
     elif sentences:
-        typer.echo("(showing raw sentences — run with an extraction model to get structured facts)\n")
+        typer.echo(
+            "(showing raw sentences — run with an extraction model to get structured facts)\n"
+        )
         for i, sent in enumerate(sentences, 1):
             dist = sent.get("distance")
             score_str = f"  [{1 - dist:.3f}]" if dist is not None else ""
@@ -302,6 +312,7 @@ def search(
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------
+
 
 @app.command(name="list")
 def list_memories(
@@ -339,6 +350,7 @@ def list_memories(
 # ---------------------------------------------------------------------------
 # delete
 # ---------------------------------------------------------------------------
+
 
 @app.command()
 def delete(
