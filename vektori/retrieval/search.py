@@ -224,7 +224,8 @@ class SearchPipeline:
         # Apply min score floor
         if self.min_score > 0:
             scored_facts = [
-                f for f in scored_facts
+                f
+                for f in scored_facts
                 if f.get("_score_components", {}).get("similarity", f["score"]) >= self.min_score
             ]
 
@@ -381,7 +382,8 @@ class SearchPipeline:
 
         if self.min_score > 0:
             scored_facts = [
-                f for f in scored_facts
+                f
+                for f in scored_facts
                 if f.get("_score_components", {}).get("similarity", f["score"]) >= self.min_score
             ]
 
@@ -494,7 +496,8 @@ class SearchPipeline:
 
         if self.min_score > 0:
             scored_facts = [
-                f for f in scored_facts
+                f
+                for f in scored_facts
                 if f.get("_score_components", {}).get("similarity", f["score"]) >= self.min_score
             ]
 
