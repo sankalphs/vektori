@@ -126,6 +126,9 @@ Rules:
     "RETRIEVAL_FAILURE" — if verdict is WRONG/ABSTAINED and context_has_answer is false
 - For temporal-reasoning questions: off-by-one errors in day/time counts = PARTIALLY_CORRECT
 - For knowledge-update questions: accept updated answer if it matches expected
+- For list answers: order does NOT matter — "cooking and photography" equals "photography and cooking" = CORRECT
+- For arithmetic breakdowns: if the model gives a breakdown that totals to the expected value, verdict is CORRECT (e.g. "3 days Big Sur + 5 days Yellowstone" when expected is "8 days")
+- Extra correct details do NOT make an answer wrong (e.g. "yellow dress and earrings" when expected is "yellow dress" = CORRECT, not WRONG)
 - For questions where QUESTION TYPE ends with "_abs": the question is designed to be unanswerable. If the model's answer is an abstention ("I don't have that information", "I cannot answer", "not enough information", etc.), verdict must be CORRECT — the model correctly identified the question as unanswerable. The expected_answer text is only an example explanation, not a required phrase to match.
 
 Respond with exactly this JSON structure:
