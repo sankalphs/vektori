@@ -11,10 +11,12 @@ def score_and_rank(
     facts: list[dict[str, Any]],
     temporal_decay_rate: float = 0.001,
     use_mentions: bool = True,
+    user_source_weight: float = 1.0,
+    assistant_source_weight: float = 0.9,
 ) -> list[dict[str, Any]]:
     """Score facts and sort by relevance descending.
 
-    Final score = similarity × confidence × recency × mentions_boost
+    Final score = similarity × confidence × recency × mentions_boost × source_weight
 
     Components:
         similarity     — cosine similarity from pgvector (1 - distance).
@@ -37,16 +39,27 @@ def score_and_rank(
                          appearing are more "established" and deserve a small lift.
                          Capped so it never dominates over similarity.
 
+        source_weight  — Multiplicative weight based on metadata.source ("user" or
+                         "assistant"). User facts are preferred for personal-context
+                         queries; assistant facts are slightly down-weighted by default
+                         so they don't compete equally with user-stated preferences.
+                         Set both weights to 1.0 to disable this signal.
+
     Args:
         facts: List of fact dicts from the storage backend. Expected fields:
                "distance" (float, pgvector cosine distance — lower is closer),
                "confidence" (float, 0-1),
                "created_at" (datetime or str),
-               "mentions" (int, optional — defaults to 1).
+               "mentions" (int, optional — defaults to 1),
+               "metadata" (dict, optional — may contain "source": "user"|"assistant").
         temporal_decay_rate: Decay per day. 0.001 ≈ 36%/year. Set higher (e.g.
                              0.01) for use-cases where freshness matters more.
         use_mentions: Whether to apply the mentions boost. Disable if your
                       storage backend doesn't track mentions.
+        user_source_weight: Score multiplier for facts with metadata.source="user".
+        assistant_source_weight: Score multiplier for facts with metadata.source="assistant".
+                                 Default 0.9 slightly de-prioritises assistant facts
+                                 so they don't crowd out user-stated preferences.
 
     Returns:
         Same list with a "score" field added, sorted descending by score.
@@ -97,7 +110,18 @@ def score_and_rank(
         else:
             mentions_boost = 1.0
 
-        score = similarity * confidence * recency * mentions_boost
+        # ── Source weight ────────────────────────────────────────────────────
+        # User facts are about the person speaking — they're the primary signal
+        # for preference/habit/life-event queries. Assistant facts capture what
+        # the assistant said or recommended. De-weight assistant facts slightly
+        # so they don't compete equally with user-stated preferences by default.
+        source = (fact.get("metadata") or {}).get("source", "user")
+        if source == "assistant":
+            source_weight = assistant_source_weight
+        else:
+            source_weight = user_source_weight
+
+        score = similarity * confidence * recency * mentions_boost * source_weight
 
         scored.append(
             {
@@ -109,6 +133,7 @@ def score_and_rank(
                     "confidence": round(confidence, 4),
                     "recency": round(recency, 4),
                     "mentions_boost": round(mentions_boost, 4),
+                    "source_weight": round(source_weight, 4),
                 },
             }
         )
@@ -147,11 +172,14 @@ def explain_score(fact: dict[str, Any]) -> str:
     if not components:
         return f"score={fact.get('score', '?')} (no breakdown available)"
 
+    src_w = components.get("source_weight")
+    src_part = f" × src={src_w:.4f}" if src_w is not None else ""
     return (
         f"score={fact['score']:.4f}  "
         f"[sim={components.get('similarity', '?'):.4f} × "
         f"conf={components.get('confidence', '?'):.4f} × "
         f"recency={components.get('recency', '?'):.4f} × "
-        f"mentions={components.get('mentions_boost', '?'):.4f}]  "
+        f"mentions={components.get('mentions_boost', '?'):.4f}"
+        f"{src_part}]  "
         f'→ "{fact.get("text", "")[:60]}"'
     )

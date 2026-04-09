@@ -59,8 +59,9 @@ class SearchPipeline:
         self.embedder = embedder
         self.temporal_decay_rate = temporal_decay_rate
         self.use_mentions = use_mentions
-        # Facts below this score are dropped — empty result signals "not found" (abstention).
-        # 0.3 is a reasonable floor: irrelevant facts score ~0.1-0.2, weak matches ~0.3-0.4.
+        # Facts whose cosine similarity falls below this floor are dropped — applied to
+        # similarity only (not the composite score) so old-but-relevant facts aren't
+        # penalised by temporal decay. Irrelevant facts score ~0.1-0.2, weak matches ~0.3-0.4.
         # Set to 0.0 to disable (always return something regardless of relevance).
         self.min_score = min_score
         # debug=True logs score breakdowns for each returned fact
@@ -222,13 +223,16 @@ class SearchPipeline:
 
         # Apply min score floor
         if self.min_score > 0:
-            scored_facts = [f for f in scored_facts if f["score"] >= self.min_score]
+            scored_facts = [
+                f for f in scored_facts
+                if f.get("_score_components", {}).get("similarity", f["score"]) >= self.min_score
+            ]
 
         if self.debug:
             for f in scored_facts[:top_k]:
                 logger.debug(explain_score(f))
 
-        top_k_facts = scored_facts[:top_k]
+        top_k_facts = _diverse_top_k(scored_facts, top_k)
         seed_fact_ids = [f["id"] for f in top_k_facts]
 
         if depth == "l0":
@@ -376,13 +380,16 @@ class SearchPipeline:
         )
 
         if self.min_score > 0:
-            scored_facts = [f for f in scored_facts if f["score"] >= self.min_score]
+            scored_facts = [
+                f for f in scored_facts
+                if f.get("_score_components", {}).get("similarity", f["score"]) >= self.min_score
+            ]
 
         if self.debug:
             for f in scored_facts[:top_k]:
                 logger.debug(explain_score(f))
 
-        top_facts = _clean(scored_facts[:top_k])
+        top_facts = _clean(_diverse_top_k(scored_facts, top_k))
         top_fact_ids = [f["id"] for f in top_facts]
 
         graph_episodes, vec_episodes = await asyncio.gather(
@@ -486,13 +493,16 @@ class SearchPipeline:
         )
 
         if self.min_score > 0:
-            scored_facts = [f for f in scored_facts if f["score"] >= self.min_score]
+            scored_facts = [
+                f for f in scored_facts
+                if f.get("_score_components", {}).get("similarity", f["score"]) >= self.min_score
+            ]
 
         if self.debug:
             for f in scored_facts[:top_k]:
                 logger.debug(explain_score(f))
 
-        top_facts = scored_facts[:top_k]
+        top_facts = _diverse_top_k(scored_facts, top_k)
         fact_ids = [f["id"] for f in top_facts]
 
         graph_episodes, vec_episodes, source_sentence_ids = await asyncio.gather(
@@ -608,6 +618,48 @@ def _empty(depth: str) -> dict[str, Any]:
 def _clean(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Strip internal scoring debug fields before returning to the caller."""
     return [{k: v for k, v in f.items() if k != "_score_components"} for f in facts]
+
+
+def _diverse_top_k(
+    scored_facts: list[dict[str, Any]],
+    top_k: int,
+    per_session: int = 2,
+) -> list[dict[str, Any]]:
+    """Session-diverse top-k selection.
+
+    For multi-session queries a plain top-k often returns all facts from 1-2
+    hot sessions, leaving other relevant sessions unrepresented.
+
+    Strategy:
+      1. Take up to `per_session` highest-scoring facts per unique session.
+      2. Fill any remaining slots with the global best facts not yet selected.
+
+    Facts within each phase remain in score-descending order.
+    `per_session=2` balances diversity against quality — enough to capture the
+    main signals from each session without over-diluting with low-score facts.
+    """
+    selected: list[dict[str, Any]] = []
+    session_counts: dict[str, int] = {}
+    remainder: list[dict[str, Any]] = []
+
+    # Phase 1: up to per_session facts per session
+    for f in scored_facts:
+        sid = f.get("session_id") or ""
+        if session_counts.get(sid, 0) < per_session:
+            selected.append(f)
+            session_counts[sid] = session_counts.get(sid, 0) + 1
+        else:
+            remainder.append(f)
+        if len(selected) >= top_k:
+            break
+
+    # Phase 2: fill remaining slots from global best (already score-sorted)
+    for f in remainder:
+        if len(selected) >= top_k:
+            break
+        selected.append(f)
+
+    return selected
 
 
 def _dedup(sentences: list[dict[str, Any]]) -> list[dict[str, Any]]:

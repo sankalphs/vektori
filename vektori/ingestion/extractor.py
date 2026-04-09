@@ -96,6 +96,21 @@ Rules:
 
 Return ONLY the JSON."""
 
+EPISODES_FALLBACK_PROMPT = """You are writing a brief episodic memory record summarising what was discussed in this conversation.
+
+{session_date_line}EXTRACTED FACTS (numbered):
+{facts_list}
+
+Write exactly ONE episode that captures the main topic. It must:
+- Be in third person ("the user"), 2-3 sentences
+- Reference at least one fact via fact_indices (0-based index into the list above)
+- Be concrete — name the actual topics, preferences, or events mentioned
+
+Return JSON with exactly this structure:
+{{"episodes": [{{"text": "...", "fact_indices": [0]}}]}}
+
+Return ONLY the JSON."""
+
 
 # ── Extractor ─────────────────────────────────────────────────────────────────
 
@@ -549,6 +564,25 @@ class FactExtractor:
             return 0
 
         raw_episodes = data.get("episodes", [])[:max_episodes]
+
+        # Fallback: if the main prompt returned nothing but we have facts, retry
+        # with a simpler prompt that doesn't require a "notable event" — any
+        # session with extracted facts deserves at least one episode record.
+        if not raw_episodes:
+            logger.debug(
+                "Episode pass returned empty for session with %d facts — retrying with fallback prompt",
+                len(inserted_facts),
+            )
+            fallback_prompt = EPISODES_FALLBACK_PROMPT.format(
+                facts_list=facts_list,
+                session_date_line=session_date_line,
+            )
+            try:
+                fallback_response = await self.llm.generate(fallback_prompt, max_tokens=512)
+                raw_episodes = _parse_json_response(fallback_response).get("episodes", [])[:1]
+            except Exception as e:
+                logger.warning("Episode fallback LLM call failed: %s", e)
+
         if not raw_episodes:
             return 0
 
